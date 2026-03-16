@@ -31,13 +31,38 @@ codex2gpt/
 ## 前提
 
 - macOS / Linux
-- 已安装 `python3`
-- 已登录 Codex，并且本机存在 `~/.codex/auth.json`
+- 已安装 `python3.11+`
+- 已登录 Codex，并且当前机器存在 `~/.codex/auth.json`
+
+说明：
+
+- `run.sh` 依赖 Python 3.11 自带的 `tomllib`，不支持 Python 3.10 及以下
+- 推荐使用 Python 3.11 / 3.12
 
 如果还没登录：
 
 ```bash
 codex login
+```
+
+如果你是在 Linux 服务器上部署，推荐直接同步一份本机已经可用的 `~/.codex/auth.json` 到服务器，避免服务器网络环境导致 `codex login` 失败。
+
+推荐做法：
+
+```bash
+scp ~/.codex/auth.json root@YOUR_SERVER:/root/.codex/auth.json
+```
+
+如果你希望在服务器本机完成登录，也可以使用下面两种方式：
+
+```bash
+codex login --device-auth
+```
+
+或者用 API Key：
+
+```bash
+printenv OPENAI_API_KEY | codex login --with-api-key
 ```
 
 ## 一键启动
@@ -51,8 +76,59 @@ cd codex2gpt
 
 1. 创建 `runtime/`
 2. 生成 `runtime/lite.env`
-3. 把当前 `~/.codex/auth.json` 导入为 `runtime/accounts/oauth-01.json`
+3. 把当前机器的 `~/.codex/auth.json` 导入为 `runtime/accounts/oauth-01.json`
 4. 启动本地服务
+
+## Linux 服务器部署
+
+下面是一个最小可用的 Linux 部署流程，默认服务器上已经有可用的 Python 3.11+ 环境。
+
+推荐方案是先把本机已经可用的 `auth.json` 同步到服务器，再启动服务：
+
+```bash
+ssh root@YOUR_SERVER
+mkdir -p /root/working /root/.codex
+cd /root/working
+
+# 把项目代码放到 /root/working/codex2gpt
+git clone <your-repo-url> codex2gpt
+cd codex2gpt
+
+# 确认 Python 版本
+python3 --version
+
+# 启动服务
+./run.sh start
+```
+
+在本机执行同步认证文件：
+
+```bash
+scp ~/.codex/auth.json root@YOUR_SERVER:/root/.codex/auth.json
+```
+
+如果你不想同步认证文件，也可以在服务器本机登录后再启动：
+
+```bash
+codex login --device-auth
+./run.sh start
+```
+
+如果你的服务器上同时存在多个 Python 版本，先切到 Python 3.11+ 对应环境，再执行 `./run.sh start`。
+
+如果你希望对外提供服务，可以修改 `runtime/lite.env`：
+
+```bash
+LITE_HOST=0.0.0.0
+LITE_PORT=18100
+LITE_API_KEY=CHANGE_ME
+```
+
+然后重启：
+
+```bash
+./run.sh restart
+```
 
 ## 调用示例
 
