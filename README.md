@@ -9,6 +9,7 @@
 - 多个 `oauth.json` 账号池
 - 某个账号限流或失败时自动切到下一个账号
 - 启动后直接提供本地 `/v1/responses` 接口
+- 额外兼容 `/v1/chat/completions`
 - 模型名直接透传给 Codex 上游
 
 ## 目录结构
@@ -301,3 +302,106 @@ curl http://127.0.0.1:18100/v1/responses \
 - 这个代理现在会按 `LITE_MODEL_CONTEXT_WINDOW` 和 `LITE_MODEL_AUTO_COMPACT_TOKEN_LIMIT` 做本地预检查，超过阈值会在本地直接拒绝，避免把明显超限的请求打到上游。
 
 如果上游支持，同样可以继续传 `previous_response_id`、`truncation`、`prompt_cache_key` 等 Responses API 字段。
+
+## 兼容性增强
+
+为了兼容更多本地客户端，这个代理现在会在转发前自动清洗一批 Codex 上游不支持、但 OpenAI 兼容客户端经常会附带的字段。
+
+当前会自动忽略这些顶层字段：
+
+- `max_output_tokens`
+- `max_tokens`
+- `max_completion_tokens`
+- `metadata`
+- `service_tier`
+- `response_format`
+- `parallel_tool_calls`
+- `stream_options`
+- `user`
+- `n`
+
+这样像 `openclaw`、OpenAI SDK 兼容模式、以及部分第三方客户端在默认附带这些字段时，不会再因为上游报 `Unsupported parameter` 直接失败。
+
+## Chat Completions 兼容入口
+
+除了 `/v1/responses`，现在也支持：
+
+- `POST /v1/chat/completions`
+
+这个入口会把 Chat Completions 风格请求自动转换成 Responses 请求再发给上游。
+
+当前支持的常见输入：
+
+- `messages`
+- `tools`
+- `tool_choice`
+- `stream`
+- `temperature`
+- `reasoning`
+- `text`
+- `prompt_cache_key`
+
+说明：
+
+- `stream=true` 时，会返回 SSE 格式，并输出一个兼容的 completion chunk，最后跟 `[DONE]`
+- 目前更偏向“接口兼容”而不是“逐 token 仿真”，也就是流式返回是单块完成态输出，不是逐字增量
+
+非流式示例：
+
+```bash
+curl http://127.0.0.1:18100/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "gpt-5.4",
+    "messages": [
+      {"role": "system", "content": "你是一个助手"},
+      {"role": "user", "content": "只回复OK"}
+    ],
+    "stream": false
+  }'
+```
+
+流式示例：
+
+```bash
+curl http://127.0.0.1:18100/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "gpt-5.4",
+    "messages": [
+      {"role": "user", "content": "只回复OK"}
+    ],
+    "stream": true
+  }'
+```
+
+## 测试
+
+当前仓库已经带了标准库回归测试，重点覆盖：
+
+- 不兼容字段清洗
+- Chat Completions 转换
+- `prompt_cache_key` 保留
+- 缓存命中信息映射（`prompt_tokens_details.cached_tokens`）
+
+运行方式：
+
+```bash
+cd codex2gpt
+python3 -m unittest discover -s tests -v
+```
+
+真实缓存命中 smoke test：
+
+```bash
+cd codex2gpt
+python3 tests/cache_hit_smoke.py
+```
+
+说明：
+
+- 这个 smoke test 会对 `/v1/responses` 用同一个 `prompt_cache_key` 连续请求两次
+- 如果第二次请求返回的 `usage.input_tokens_details.cached_tokens > 0`，脚本会成功退出
+- 如果没有观察到 cache hit，脚本会返回非零退出码
+
+当前经验上，验证真实 cache hit 建议优先用 `/v1/responses`，因为它更接近上游原生返回结构

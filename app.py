@@ -39,6 +39,20 @@ UPSTREAM_HEADERS = {
     "Origin": "https://chatgpt.com",
     "Referer": "https://chatgpt.com/codex",
 }
+UNSUPPORTED_TOP_LEVEL_FIELDS = {
+    "max_output_tokens",
+    "max_tokens",
+    "max_completion_tokens",
+    "metadata",
+    "service_tier",
+    "response_format",
+    "parallel_tool_calls",
+    "stream_options",
+    "reasoning_effort",
+    "user",
+    "n",
+}
+REASONING_EFFORT_VALUES = {"minimal", "low", "medium", "high", "xhigh"}
 
 
 def parse_models(raw: str):
@@ -56,6 +70,10 @@ def parse_models(raw: str):
 
 
 ADVERTISED_MODELS = parse_models(DEFAULT_MODELS_RAW)
+
+
+def canonical_json_bytes(payload):
+    return json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
 
 
 class OAuthAccount:
@@ -252,8 +270,15 @@ def normalize_input(value):
     raise ValueError("input must be a string, object, or list")
 
 
+def strip_unsupported_top_level_fields(payload):
+    normalized = dict(payload)
+    for key in UNSUPPORTED_TOP_LEVEL_FIELDS:
+        normalized.pop(key, None)
+    return normalized
+
+
 def normalize_payload(raw_payload):
-    payload = dict(raw_payload)
+    payload = strip_unsupported_top_level_fields(raw_payload)
     payload["model"] = str(payload.get("model") or DEFAULT_MODEL)
     payload["input"] = normalize_input(payload.get("input", ""))
     payload["store"] = False
@@ -278,6 +303,184 @@ def normalize_payload(raw_payload):
     elif text is None:
         payload["text"] = {"verbosity": DEFAULT_TEXT_VERBOSITY}
     return payload
+
+
+def chat_content_to_text(content):
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        chunks = []
+        for item in content:
+            if not isinstance(item, dict):
+                continue
+            if item.get("type") == "text" and isinstance(item.get("text"), str):
+                chunks.append(item["text"])
+        return "".join(chunks)
+    if content is None:
+        return ""
+    return str(content)
+
+
+def normalize_chat_user_content(content):
+    if isinstance(content, str):
+        return [{"type": "input_text", "text": content}]
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            if not isinstance(item, dict):
+                continue
+            item_type = item.get("type")
+            if item_type == "text" and isinstance(item.get("text"), str):
+                parts.append({"type": "input_text", "text": item["text"]})
+                continue
+            if item_type == "image_url":
+                image_url = item.get("image_url")
+                if isinstance(image_url, dict):
+                    image_url = image_url.get("url")
+                if isinstance(image_url, str) and image_url.strip():
+                    parts.append({"type": "input_image", "image_url": image_url.strip(), "detail": "auto"})
+        if parts:
+            return parts
+    return [{"type": "input_text", "text": chat_content_to_text(content)}]
+
+
+def normalize_chat_tools(tools):
+    if not isinstance(tools, list):
+        return None
+    normalized = []
+    for tool in tools:
+        if not isinstance(tool, dict):
+            continue
+        if tool.get("type") != "function":
+            continue
+        function = tool.get("function")
+        if not isinstance(function, dict):
+            continue
+        name = str(function.get("name") or "").strip()
+        if not name:
+            continue
+        normalized.append(
+            {
+                "type": "function",
+                "name": name,
+                "description": function.get("description"),
+                "parameters": function.get("parameters") or {"type": "object", "properties": {}},
+            }
+        )
+    return normalized or None
+
+
+def chat_tool_choice_to_responses(tool_choice):
+    if isinstance(tool_choice, str):
+        return tool_choice
+    if not isinstance(tool_choice, dict):
+        return None
+    if tool_choice.get("type") != "function":
+        return None
+    function = tool_choice.get("function")
+    if not isinstance(function, dict):
+        return None
+    name = str(function.get("name") or "").strip()
+    if not name:
+        return None
+    return {"type": "function", "name": name}
+
+
+def build_responses_payload_from_chat(raw_payload):
+    payload = strip_unsupported_top_level_fields(raw_payload)
+    payload.pop("messages", None)
+    messages = raw_payload.get("messages")
+    if not isinstance(messages, list):
+        raise ValueError("messages must be a list")
+
+    instructions = []
+    input_items = []
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        role = str(msg.get("role") or "").strip()
+        if role in {"system", "developer"}:
+            text = chat_content_to_text(msg.get("content"))
+            if text:
+                instructions.append(text)
+            continue
+        if role == "user":
+            input_items.append(
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": normalize_chat_user_content(msg.get("content")),
+                }
+            )
+            continue
+        if role == "assistant":
+            output_parts = []
+            text = chat_content_to_text(msg.get("content"))
+            if text:
+                output_parts.append({"type": "output_text", "text": text, "annotations": []})
+            if output_parts:
+                input_items.append(
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "status": "completed",
+                        "content": output_parts,
+                    }
+                )
+            for tool_call in msg.get("tool_calls") or []:
+                if not isinstance(tool_call, dict):
+                    continue
+                if tool_call.get("type") != "function":
+                    continue
+                function = tool_call.get("function") or {}
+                name = str(function.get("name") or "").strip()
+                if not name:
+                    continue
+                arguments = function.get("arguments", "{}")
+                if not isinstance(arguments, str):
+                    arguments = json.dumps(arguments, ensure_ascii=False)
+                call_id = str(tool_call.get("id") or f"call_{len(input_items)}")
+                input_items.append(
+                    {
+                        "type": "function_call",
+                        "call_id": call_id,
+                        "name": name,
+                        "arguments": arguments,
+                    }
+                )
+            continue
+        if role == "tool":
+            call_id = str(msg.get("tool_call_id") or "").strip()
+            if not call_id:
+                continue
+            input_items.append(
+                {
+                    "type": "function_call_output",
+                    "call_id": call_id,
+                    "output": chat_content_to_text(msg.get("content")),
+                }
+            )
+
+    if not input_items:
+        input_items = normalize_input("")
+
+    payload["model"] = str(payload.get("model") or DEFAULT_MODEL)
+    payload["input"] = input_items
+    if instructions:
+        payload["instructions"] = "\n\n".join(instructions)
+    reasoning_effort = raw_payload.get("reasoning_effort")
+    if isinstance(reasoning_effort, str):
+        effort = reasoning_effort.strip().lower()
+        if effort in REASONING_EFFORT_VALUES:
+            payload["reasoning"] = {"effort": effort}
+    if "tools" in raw_payload:
+        payload["tools"] = normalize_chat_tools(raw_payload.get("tools"))
+    tool_choice = chat_tool_choice_to_responses(raw_payload.get("tool_choice"))
+    if tool_choice is not None:
+        payload["tool_choice"] = tool_choice
+    elif isinstance(raw_payload.get("tool_choice"), str):
+        payload["tool_choice"] = raw_payload.get("tool_choice")
+    return normalize_payload(payload)
 
 
 def extract_session_key(headers, raw_payload):
@@ -375,6 +578,125 @@ def extract_final_response(sse_body: str):
     return None
 
 
+def response_output_text(response):
+    chunks = []
+    for item in response.get("output") or []:
+        if item.get("type") != "message" or item.get("role") != "assistant":
+            continue
+        for content in item.get("content") or []:
+            content_type = content.get("type")
+            if content_type == "output_text":
+                chunks.append(content.get("text", ""))
+            elif content_type == "refusal":
+                chunks.append(content.get("refusal", ""))
+    return "".join(chunks)
+
+
+def response_output_tool_calls(response):
+    tool_calls = []
+    for index, item in enumerate(response.get("output") or []):
+        if item.get("type") != "function_call":
+            continue
+        arguments = item.get("arguments", "{}")
+        tool_calls.append(
+            {
+                "id": str(item.get("call_id") or f"call_{index}"),
+                "type": "function",
+                "function": {
+                    "name": item.get("name", ""),
+                    "arguments": arguments if isinstance(arguments, str) else json.dumps(arguments, ensure_ascii=False),
+                },
+            }
+        )
+    return tool_calls
+
+
+def response_finish_reason(response):
+    if response_output_tool_calls(response):
+        return "tool_calls"
+    status = response.get("status")
+    if status == "incomplete":
+        return "length"
+    return "stop"
+
+
+def response_usage_to_chat(response):
+    usage = response.get("usage") or {}
+    input_tokens = int(usage.get("input_tokens") or 0)
+    output_tokens = int(usage.get("output_tokens") or 0)
+    prompt_details = {}
+    input_details = usage.get("input_tokens_details") or {}
+    cached_tokens = int(input_details.get("cached_tokens") or 0)
+    if cached_tokens:
+        prompt_details["cached_tokens"] = cached_tokens
+    chat_usage = {
+        "prompt_tokens": input_tokens,
+        "completion_tokens": output_tokens,
+        "total_tokens": input_tokens + output_tokens,
+    }
+    if prompt_details:
+        chat_usage["prompt_tokens_details"] = prompt_details
+    return chat_usage
+
+
+def response_to_chat_completion(response):
+    message = {
+        "role": "assistant",
+        "content": response_output_text(response) or None,
+    }
+    tool_calls = response_output_tool_calls(response)
+    if tool_calls:
+        message["tool_calls"] = tool_calls
+    return {
+        "id": response.get("id", f"chatcmpl-{int(time.time())}"),
+        "object": "chat.completion",
+        "created": int(response.get("created_at") or time.time()),
+        "model": response.get("model", DEFAULT_MODEL),
+        "choices": [
+            {
+                "index": 0,
+                "message": message,
+                "finish_reason": response_finish_reason(response),
+            }
+        ],
+        "usage": response_usage_to_chat(response),
+    }
+
+
+def chat_completion_chunk_from_response(response):
+    delta = {"role": "assistant"}
+    text = response_output_text(response)
+    if text:
+        delta["content"] = text
+    tool_calls = response_output_tool_calls(response)
+    if tool_calls:
+        delta["tool_calls"] = tool_calls
+    return {
+        "id": response.get("id", f"chatcmpl-{int(time.time())}"),
+        "object": "chat.completion.chunk",
+        "created": int(response.get("created_at") or time.time()),
+        "model": response.get("model", DEFAULT_MODEL),
+        "choices": [
+            {
+                "index": 0,
+                "delta": delta,
+                "finish_reason": response_finish_reason(response),
+            }
+        ],
+    }
+
+
+def chat_completion_usage_chunk_from_response(response):
+    return {
+        "id": response.get("id", f"chatcmpl-{int(time.time())}"),
+        "object": "chat.completion.chunk",
+        "created": int(response.get("created_at") or time.time()),
+        "model": response.get("model", DEFAULT_MODEL),
+        "choices": [],
+        "usage": response_usage_to_chat(response),
+    }
+
+
 def parse_auth_header(headers):
     value = headers.get("authorization", "")
     if value.lower().startswith("bearer "):
@@ -449,6 +771,47 @@ class Handler(BaseHTTPRequestHandler):
         self._write_json(404, {"error": {"type": "not_found", "message": "not found"}})
 
     def do_POST(self):
+        if self.path == "/v1/chat/completions":
+            if not self._require_api_key():
+                return
+            try:
+                raw_payload = self._read_json()
+                payload = build_responses_payload_from_chat(raw_payload)
+                session_key = extract_session_key(self.headers, raw_payload)
+                ensure_prompt_cache_key(payload, session_key)
+                payload["stream"] = True
+            except Exception as exc:
+                self._write_json(400, {"error": {"type": "invalid_request_error", "message": str(exc)}})
+                return
+            estimated_tokens, budget_error = validate_context_budget(payload)
+            if budget_error:
+                self._write_json(
+                    413,
+                    {
+                        "error": {
+                            "type": "context_limit_error",
+                            "message": budget_error,
+                            "estimated_input_tokens": estimated_tokens,
+                            "model_context_window": DEFAULT_MODEL_CONTEXT_WINDOW,
+                            "model_auto_compact_token_limit": DEFAULT_MODEL_AUTO_COMPACT_TOKEN_LIMIT,
+                        }
+                    },
+                )
+                return
+            try:
+                response = self._fetch_final_response(payload, session_key)
+                if raw_payload.get("stream"):
+                    stream_options = raw_payload.get("stream_options") or {}
+                    include_usage = bool(stream_options.get("include_usage"))
+                    self._write_chat_completion_sse(response, include_usage=include_usage)
+                    return
+                self._write_json(200, response_to_chat_completion(response))
+            except urllib.error.HTTPError as exc:
+                self._forward_http_error(exc)
+            except Exception as exc:
+                self._write_json(502, {"error": {"type": "upstream_error", "message": str(exc)}})
+            return
+
         if self.path != "/v1/responses":
             self._write_json(404, {"error": {"type": "not_found", "message": "not found"}})
             return
@@ -483,14 +846,14 @@ class Handler(BaseHTTPRequestHandler):
         payload["stream"] = True
 
         try:
-            self._forward(payload, wants_stream, session_key)
+            self._forward_responses(payload, wants_stream, session_key)
         except urllib.error.HTTPError as exc:
             self._forward_http_error(exc)
         except Exception as exc:
             self._write_json(502, {"error": {"type": "upstream_error", "message": str(exc)}})
 
     def _upstream_once(self, payload, account, session_key, allow_refresh=True):
-        body = json.dumps(payload, ensure_ascii=False).encode()
+        body = canonical_json_bytes(payload)
         headers = build_upstream_headers(account, session_key)
         req = urllib.request.Request(UPSTREAM_URL, data=body, headers=headers, method="POST")
         try:
@@ -519,7 +882,15 @@ class Handler(BaseHTTPRequestHandler):
                     raise
         raise last_error or RuntimeError("all accounts failed")
 
-    def _forward(self, payload, wants_stream, session_key):
+    def _fetch_final_response(self, payload, session_key):
+        with self._upstream(payload, session_key) as upstream:
+            sse_body = upstream.read().decode("utf-8", errors="replace")
+        response = extract_final_response(sse_body)
+        if response is None:
+            raise RuntimeError("failed to extract final response from upstream stream")
+        return response
+
+    def _forward_responses(self, payload, wants_stream, session_key):
         with self._upstream(payload, session_key) as upstream:
             if wants_stream:
                 self.send_response(upstream.status)
@@ -535,11 +906,26 @@ class Handler(BaseHTTPRequestHandler):
                     self.wfile.flush()
                 return
 
-            sse_body = upstream.read().decode("utf-8", errors="replace")
-            response = extract_final_response(sse_body)
+            response = extract_final_response(upstream.read().decode("utf-8", errors="replace"))
             if response is None:
                 raise RuntimeError("failed to extract final response from upstream stream")
             self._write_json(200, response)
+
+    def _write_chat_completion_sse(self, response, include_usage=False):
+        frames = [f"data: {json.dumps(chat_completion_chunk_from_response(response), ensure_ascii=False)}\n\n"]
+        if include_usage:
+            usage_chunk = chat_completion_usage_chunk_from_response(response)
+            frames.append(f"data: {json.dumps(usage_chunk, ensure_ascii=False)}\n\n")
+        frames.append("data: [DONE]\n\n")
+        body = "".join(frames).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "close")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+        self.wfile.flush()
 
     def _forward_http_error(self, exc):
         body = exc.read().decode("utf-8", errors="replace")
