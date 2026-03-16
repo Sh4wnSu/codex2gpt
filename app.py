@@ -25,6 +25,7 @@ DEFAULT_MODEL_AUTO_COMPACT_TOKEN_LIMIT = int(
     os.environ.get("LITE_MODEL_AUTO_COMPACT_TOKEN_LIMIT", str((DEFAULT_MODEL_CONTEXT_WINDOW * 9) // 10))
     or str((DEFAULT_MODEL_CONTEXT_WINDOW * 9) // 10)
 )
+SESSION_STICKY_TTL = int(os.environ.get("LITE_SESSION_STICKY_TTL", "3600") or "3600")
 CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
 TOKEN_URL = "https://auth.openai.com/oauth/token"
 UPSTREAM_URL = "https://chatgpt.com/backend-api/codex/responses"
@@ -120,6 +121,7 @@ class AccountPool:
         self.lock = threading.Lock()
         self.accounts = []
         self.cooldowns = {}
+        self.sticky_sessions = {}
         self.next_index = 0
         self.reload()
 
@@ -135,6 +137,11 @@ class AccountPool:
         with self.lock:
             self.accounts = accounts
             self.cooldowns = {k: v for k, v in self.cooldowns.items() if v > time.time()}
+            self.sticky_sessions = {
+                session_key: binding
+                for session_key, binding in self.sticky_sessions.items()
+                if binding["expires_at"] > time.time() and any(account.name == binding["account_name"] for account in accounts)
+            }
             if self.accounts:
                 self.next_index %= len(self.accounts)
             else:
@@ -148,17 +155,65 @@ class AccountPool:
         with self.lock:
             return len(self.accounts)
 
-    def candidates(self):
+    def sticky_size(self):
         with self.lock:
-            accounts = list(self.accounts)
-            if not accounts:
+            self._prune_sticky_sessions_locked()
+            return len(self.sticky_sessions)
+
+    def _prune_sticky_sessions_locked(self):
+        now = time.time()
+        self.sticky_sessions = {
+            session_key: binding
+            for session_key, binding in self.sticky_sessions.items()
+            if binding["expires_at"] > now
+        }
+
+    def _base_order_locked(self):
+        accounts = list(self.accounts)
+        if not accounts:
+            return []
+        start = self.next_index % len(accounts)
+        self.next_index = (start + 1) % len(accounts)
+        ordered = accounts[start:] + accounts[:start]
+        now = time.time()
+        active = [a for a in ordered if self.cooldowns.get(a.name, 0) <= now]
+        return active or ordered
+
+    def candidates(self, session_key: str = ""):
+        with self.lock:
+            self._prune_sticky_sessions_locked()
+            ordered = self._base_order_locked()
+            if not ordered:
                 return []
-            start = self.next_index % len(accounts)
-            self.next_index = (start + 1) % len(accounts)
-            ordered = accounts[start:] + accounts[:start]
-            now = time.time()
-            active = [a for a in ordered if self.cooldowns.get(a.name, 0) <= now]
-            return active or ordered
+            session_key = session_key.strip()
+            if not session_key:
+                return ordered
+            binding = self.sticky_sessions.get(session_key)
+            if not binding:
+                return ordered
+            preferred_name = binding["account_name"]
+            preferred = None
+            others = []
+            for account in ordered:
+                if account.name == preferred_name and preferred is None:
+                    preferred = account
+                else:
+                    others.append(account)
+            if preferred is None:
+                self.sticky_sessions.pop(session_key, None)
+                return ordered
+            return [preferred] + others
+
+    def bind_session(self, session_key: str, account_name: str):
+        session_key = session_key.strip()
+        if not session_key or not account_name:
+            return
+        with self.lock:
+            self._prune_sticky_sessions_locked()
+            self.sticky_sessions[session_key] = {
+                "account_name": account_name,
+                "expires_at": time.time() + max(1, SESSION_STICKY_TTL),
+            }
 
     def mark_failure(self, account_name: str, error):
         cooldown = 30
@@ -171,6 +226,11 @@ class AccountPool:
                 cooldown = 30
         with self.lock:
             self.cooldowns[account_name] = time.time() + cooldown
+            self.sticky_sessions = {
+                session_key: binding
+                for session_key, binding in self.sticky_sessions.items()
+                if binding["account_name"] != account_name
+            }
 
 
 pool = AccountPool(AUTH_DIR)
@@ -218,6 +278,37 @@ def normalize_payload(raw_payload):
     elif text is None:
         payload["text"] = {"verbosity": DEFAULT_TEXT_VERBOSITY}
     return payload
+
+
+def extract_session_key(headers, raw_payload):
+    session_key = ""
+    if headers is not None:
+        session_key = str(headers.get("session_id", "")).strip()
+        if not session_key:
+            session_key = str(headers.get("conversation_id", "")).strip()
+    if session_key:
+        return session_key
+    if isinstance(raw_payload, dict):
+        prompt_cache_key = raw_payload.get("prompt_cache_key")
+        if isinstance(prompt_cache_key, str) and prompt_cache_key.strip():
+            return prompt_cache_key.strip()
+    return ""
+
+
+def ensure_prompt_cache_key(payload, session_key):
+    if not session_key:
+        return
+    if not isinstance(payload.get("prompt_cache_key"), str) or not payload.get("prompt_cache_key", "").strip():
+        payload["prompt_cache_key"] = session_key
+
+
+def build_upstream_headers(account, session_key):
+    headers = dict(UPSTREAM_HEADERS)
+    headers["Authorization"] = f"Bearer {account.access_token()}"
+    if session_key:
+        headers["conversation_id"] = session_key
+        headers["session_id"] = session_key
+    return headers
 
 
 def estimate_text_tokens(text):
@@ -328,6 +419,7 @@ class Handler(BaseHTTPRequestHandler):
                 {
                     "status": "ok",
                     "accounts": pool.names(),
+                    "sticky_sessions": pool.sticky_size(),
                     "model_context_window": DEFAULT_MODEL_CONTEXT_WINDOW,
                     "model_auto_compact_token_limit": DEFAULT_MODEL_AUTO_COMPACT_TOKEN_LIMIT,
                 },
@@ -365,6 +457,8 @@ class Handler(BaseHTTPRequestHandler):
         try:
             raw_payload = self._read_json()
             payload = normalize_payload(raw_payload)
+            session_key = extract_session_key(self.headers, raw_payload)
+            ensure_prompt_cache_key(payload, session_key)
         except Exception as exc:
             self._write_json(400, {"error": {"type": "invalid_request_error", "message": str(exc)}})
             return
@@ -389,33 +483,35 @@ class Handler(BaseHTTPRequestHandler):
         payload["stream"] = True
 
         try:
-            self._forward(payload, wants_stream)
+            self._forward(payload, wants_stream, session_key)
         except urllib.error.HTTPError as exc:
             self._forward_http_error(exc)
         except Exception as exc:
             self._write_json(502, {"error": {"type": "upstream_error", "message": str(exc)}})
 
-    def _upstream_once(self, payload, account, allow_refresh=True):
+    def _upstream_once(self, payload, account, session_key, allow_refresh=True):
         body = json.dumps(payload, ensure_ascii=False).encode()
-        headers = dict(UPSTREAM_HEADERS)
-        headers["Authorization"] = f"Bearer {account.access_token()}"
+        headers = build_upstream_headers(account, session_key)
         req = urllib.request.Request(UPSTREAM_URL, data=body, headers=headers, method="POST")
         try:
             return urllib.request.urlopen(req, timeout=120)
         except urllib.error.HTTPError as exc:
             if allow_refresh and exc.code in {401, 403}:
                 account.refresh_access_token()
-                return self._upstream_once(payload, account, allow_refresh=False)
+                return self._upstream_once(payload, account, session_key, allow_refresh=False)
             raise
 
-    def _upstream(self, payload):
-        accounts = pool.candidates()
+    def _upstream(self, payload, session_key):
+        accounts = pool.candidates(session_key)
         if not accounts:
             raise RuntimeError(f"no oauth json found in {AUTH_DIR}")
         last_error = None
         for account in accounts:
             try:
-                return self._upstream_once(payload, account)
+                upstream = self._upstream_once(payload, account, session_key)
+                if session_key:
+                    pool.bind_session(session_key, account.name)
+                return upstream
             except Exception as exc:
                 last_error = exc
                 pool.mark_failure(account.name, exc)
@@ -423,8 +519,8 @@ class Handler(BaseHTTPRequestHandler):
                     raise
         raise last_error or RuntimeError("all accounts failed")
 
-    def _forward(self, payload, wants_stream):
-        with self._upstream(payload) as upstream:
+    def _forward(self, payload, wants_stream, session_key):
+        with self._upstream(payload, session_key) as upstream:
             if wants_stream:
                 self.send_response(upstream.status)
                 self.send_header("Content-Type", "text/event-stream; charset=utf-8")
