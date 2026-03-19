@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import contextlib
 import io
 import json
 import os
@@ -27,6 +28,8 @@ DEFAULT_MODEL_AUTO_COMPACT_TOKEN_LIMIT = int(
     or str((DEFAULT_MODEL_CONTEXT_WINDOW * 9) // 10)
 )
 SESSION_STICKY_TTL = int(os.environ.get("LITE_SESSION_STICKY_TTL", "3600") or "3600")
+SESSION_LOCK_TTL = int(os.environ.get("LITE_SESSION_LOCK_TTL", str(max(SESSION_STICKY_TTL, 300))) or str(max(SESSION_STICKY_TTL, 300)))
+DEFAULT_BUSINESS_KEY = os.environ.get("LITE_DEFAULT_BUSINESS_KEY", "default").strip() or "default"
 CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
 TOKEN_URL = "https://auth.openai.com/oauth/token"
 UPSTREAM_URL = "https://chatgpt.com/backend-api/codex/responses"
@@ -52,6 +55,10 @@ UNSUPPORTED_TOP_LEVEL_FIELDS = {
     "reasoning_effort",
     "user",
     "n",
+    "business_key",
+    "client_id",
+    "conversation_id",
+    "session_id",
 }
 REASONING_EFFORT_VALUES = {"minimal", "low", "medium", "high", "xhigh"}
 
@@ -283,6 +290,76 @@ class AccountPool:
 pool = AccountPool(AUTH_DIR)
 
 
+class SessionCoordinator:
+    def __init__(self, ttl_seconds: int):
+        self.ttl_seconds = max(1, ttl_seconds)
+        self.lock = threading.Lock()
+        self.sessions = {}
+
+    def _prune_locked(self):
+        now = time.time()
+        self.sessions = {
+            session_key: state
+            for session_key, state in self.sessions.items()
+            if state["holders"] > 0 or state["waiters"] > 0 or state["expires_at"] > now
+        }
+
+    def snapshot(self):
+        with self.lock:
+            self._prune_locked()
+            active_sessions = 0
+            queued_requests = 0
+            for state in self.sessions.values():
+                if state["holders"] > 0:
+                    active_sessions += 1
+                queued_requests += state["waiters"]
+            return {
+                "tracked_sessions": len(self.sessions),
+                "active_sessions": active_sessions,
+                "queued_requests": queued_requests,
+            }
+
+    @contextlib.contextmanager
+    def hold(self, session_key: str):
+        session_key = session_key.strip()
+        if not session_key:
+            yield
+            return
+
+        with self.lock:
+            self._prune_locked()
+            state = self.sessions.get(session_key)
+            if state is None:
+                state = {
+                    "lock": threading.Lock(),
+                    "holders": 0,
+                    "waiters": 0,
+                    "expires_at": time.time() + self.ttl_seconds,
+                }
+                self.sessions[session_key] = state
+            state["waiters"] += 1
+            state["expires_at"] = time.time() + self.ttl_seconds
+
+        state["lock"].acquire()
+        with self.lock:
+            state["waiters"] = max(0, state["waiters"] - 1)
+            state["holders"] += 1
+            state["expires_at"] = time.time() + self.ttl_seconds
+
+        try:
+            yield
+        finally:
+            with self.lock:
+                state["holders"] = max(0, state["holders"] - 1)
+                state["expires_at"] = time.time() + self.ttl_seconds
+            state["lock"].release()
+            with self.lock:
+                self._prune_locked()
+
+
+session_coordinator = SessionCoordinator(SESSION_LOCK_TTL)
+
+
 def normalize_input(value):
     if isinstance(value, str):
         return [
@@ -512,19 +589,81 @@ def build_responses_payload_from_chat(raw_payload):
     return normalize_payload(payload)
 
 
-def extract_session_key(headers, raw_payload):
-    session_key = ""
-    if headers is not None:
-        session_key = str(headers.get("session_id", "")).strip()
-        if not session_key:
-            session_key = str(headers.get("conversation_id", "")).strip()
+def extract_header_value(headers, *names):
+    if headers is None:
+        return ""
+    for name in names:
+        value = headers.get(name, "")
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def request_source_ip(headers, client_ip):
+    forwarded_for = extract_header_value(headers, "x-forwarded-for")
+    if forwarded_for:
+        return forwarded_for.split(",")[0].strip()
+    real_ip = extract_header_value(headers, "x-real-ip")
+    if real_ip:
+        return real_ip
+    return str(client_ip or "").strip()
+
+
+def extract_explicit_session_key(headers, raw_payload):
+    session_key = extract_header_value(headers, "session_id", "conversation_id")
     if session_key:
         return session_key
-    if isinstance(raw_payload, dict):
-        prompt_cache_key = raw_payload.get("prompt_cache_key")
-        if isinstance(prompt_cache_key, str) and prompt_cache_key.strip():
-            return prompt_cache_key.strip()
+    if not isinstance(raw_payload, dict):
+        return ""
+    for key in ("session_id", "conversation_id", "prompt_cache_key"):
+        value = raw_payload.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
     return ""
+
+
+def extract_client_id(headers, raw_payload, client_ip):
+    if isinstance(raw_payload, dict):
+        value = raw_payload.get("client_id")
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    value = extract_header_value(headers, "x-client-id", "client_id")
+    if value:
+        return value
+    return request_source_ip(headers, client_ip)
+
+
+def extract_business_key(headers, raw_payload):
+    if isinstance(raw_payload, dict):
+        value = raw_payload.get("business_key")
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    value = extract_header_value(headers, "x-business-key", "business_key")
+    if value:
+        return value
+    return DEFAULT_BUSINESS_KEY
+
+
+def build_session_key(client_id, business_key):
+    client_id = str(client_id or "").strip()
+    business_key = str(business_key or "").strip() or DEFAULT_BUSINESS_KEY
+    if not client_id:
+        return ""
+    return f"{client_id}:{business_key}"
+
+
+def extract_session_context(headers, raw_payload, client_ip):
+    explicit_session_key = extract_explicit_session_key(headers, raw_payload)
+    client_id = extract_client_id(headers, raw_payload, client_ip)
+    business_key = extract_business_key(headers, raw_payload)
+    derived_session_key = build_session_key(client_id, business_key)
+    return {
+        "session_key": explicit_session_key or derived_session_key,
+        "client_id": client_id,
+        "business_key": business_key,
+        "explicit_session_key": explicit_session_key,
+        "derived_session_key": derived_session_key,
+    }
 
 
 def ensure_prompt_cache_key(payload, session_key):
@@ -787,6 +926,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path == "/health":
+            session_stats = session_coordinator.snapshot()
             self._write_json(
                 200,
                 {
@@ -794,6 +934,9 @@ class Handler(BaseHTTPRequestHandler):
                     "accounts": pool.names(),
                     "sticky_sessions": pool.sticky_size(),
                     "preferred_account": pool.preferred_account(),
+                    "tracked_sessions": session_stats["tracked_sessions"],
+                    "active_sessions": session_stats["active_sessions"],
+                    "queued_requests": session_stats["queued_requests"],
                     "model_context_window": DEFAULT_MODEL_CONTEXT_WINDOW,
                     "model_auto_compact_token_limit": DEFAULT_MODEL_AUTO_COMPACT_TOKEN_LIMIT,
                 },
@@ -829,7 +972,7 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 raw_payload = self._read_json()
                 payload = build_responses_payload_from_chat(raw_payload)
-                session_key = extract_session_key(self.headers, raw_payload)
+                session_key = extract_session_context(self.headers, raw_payload, self.client_address[0])["session_key"]
                 ensure_prompt_cache_key(payload, session_key)
                 payload["stream"] = True
             except Exception as exc:
@@ -851,7 +994,8 @@ class Handler(BaseHTTPRequestHandler):
                 )
                 return
             try:
-                response = self._fetch_final_response(payload, session_key)
+                with session_coordinator.hold(session_key):
+                    response = self._fetch_final_response(payload, session_key)
                 if raw_payload.get("stream"):
                     stream_options = raw_payload.get("stream_options") or {}
                     include_usage = bool(stream_options.get("include_usage"))
@@ -872,7 +1016,7 @@ class Handler(BaseHTTPRequestHandler):
         try:
             raw_payload = self._read_json()
             payload = normalize_payload(raw_payload)
-            session_key = extract_session_key(self.headers, raw_payload)
+            session_key = extract_session_context(self.headers, raw_payload, self.client_address[0])["session_key"]
             ensure_prompt_cache_key(payload, session_key)
         except Exception as exc:
             self._write_json(400, {"error": {"type": "invalid_request_error", "message": str(exc)}})
@@ -898,7 +1042,8 @@ class Handler(BaseHTTPRequestHandler):
         payload["stream"] = True
 
         try:
-            self._forward_responses(payload, wants_stream, session_key)
+            with session_coordinator.hold(session_key):
+                self._forward_responses(payload, wants_stream, session_key)
         except urllib.error.HTTPError as exc:
             self._forward_http_error(exc)
         except Exception as exc:
