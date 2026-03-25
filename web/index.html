@@ -1,0 +1,309 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title data-i18n="page.title">Codex2gpt 控制台</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="topbar-inner">
+        <a href="#/" class="brand">
+          <span class="brand-mark">C2G</span>
+          <span class="brand-copy">
+            <strong data-i18n="brand.title">Codex2gpt 控制台</strong>
+            <small data-i18n="brand.subtitle">账号、路由与传输的运行控制台</small>
+          </span>
+        </a>
+        <div class="topbar-navwrap">
+          <p class="topbar-caption" data-i18n="topbar.caption">操作工作台</p>
+          <div class="topbar-controls">
+            <nav class="nav-pills" aria-label="Primary">
+              <a href="#/" data-view-link="overview" data-i18n="nav.overview">总览</a>
+              <a href="#/proxy-settings" data-view-link="proxy-settings" data-i18n="nav.proxy">代理设置</a>
+              <a href="#/usage-stats" data-view-link="usage-stats" data-i18n="nav.usage">用量统计</a>
+            </nav>
+            <label class="language-switch">
+              <span data-i18n="topbar.language">语言</span>
+              <select id="language-select" aria-label="Language">
+                <option value="zh-CN">中文</option>
+                <option value="en">English</option>
+              </select>
+            </label>
+          </div>
+        </div>
+      </div>
+    </header>
+
+    <main class="shell">
+      <section class="summary-strip summary-strip-top" id="summary-strip">
+        <article class="stat">
+          <span class="stat-label" data-i18n="summary.accounts">账号</span>
+          <strong id="stat-accounts">-</strong>
+          <span class="stat-meta" id="stat-accounts-meta" data-i18n="common.loading">加载中...</span>
+        </article>
+        <article class="stat">
+          <span class="stat-label" data-i18n="summary.warnings">告警</span>
+          <strong id="stat-warnings">-</strong>
+          <span class="stat-meta" id="stat-warnings-meta" data-i18n="common.loading">加载中...</span>
+        </article>
+        <article class="stat">
+          <span class="stat-label" data-i18n="summary.transport">传输</span>
+          <strong id="stat-transport">-</strong>
+          <span class="stat-meta" id="stat-transport-meta" data-i18n="common.loading">加载中...</span>
+        </article>
+        <article class="stat">
+          <span class="stat-label" data-i18n="summary.responses">Responses</span>
+          <strong id="stat-responses-transport">-</strong>
+          <span class="stat-meta" id="stat-responses-transport-meta" data-i18n="common.loading">加载中...</span>
+        </article>
+      </section>
+
+      <section id="warning-banner"></section>
+
+      <section class="runtime-strip card">
+        <div class="runtime-strip-copy">
+          <p class="eyebrow" data-i18n="runtime.eyebrow">实时状态</p>
+          <h2 data-i18n="runtime.title">运行快照</h2>
+          <p class="subcopy small" data-i18n="runtime.subtitle">当前路由模式、认证状态、WebSocket 就绪情况与告警状态。</p>
+        </div>
+        <div class="badge-row" id="runtime-badges"></div>
+      </section>
+
+      <section class="view-panel is-active" data-view-panel="overview">
+        <section class="section-heading section-heading-tight">
+          <div>
+            <p class="eyebrow" data-i18n="overview.accounts.eyebrow">账号</p>
+            <h2 data-i18n="overview.accounts.title">账号总览</h2>
+            <p class="subcopy small" data-i18n="overview.accounts.subtitle">一眼查看额度状态、代理分配和 Codex App 占用情况。</p>
+          </div>
+          <div class="badge-row" id="account-filters"></div>
+        </section>
+        <div id="accounts-list" class="account-grid" data-i18n="common.loading">加载中...</div>
+
+        <section class="section-heading">
+          <div>
+            <p class="eyebrow" data-i18n="overview.tasks.eyebrow">操作任务</p>
+            <h2 data-i18n="overview.tasks.title">控制面板</h2>
+            <p class="subcopy small" data-i18n="overview.tasks.subtitle">优先展示核心动作，再补充细节和历史信息。</p>
+          </div>
+        </section>
+
+        <div class="overview-layout">
+          <div class="stack-xl">
+            <article class="card card-emphasis">
+            <p class="card-kicker" data-i18n="auth.kicker">认证</p>
+            <h2 data-i18n="auth.title">添加账号</h2>
+            <p class="subcopy small" data-i18n-html="auth.subtitle">为另一个 Codex 账号启动浏览器 OAuth 流程。默认会使用 <code>localhost:1455</code> 的本地回调；如果未能自动完成，可以手动粘贴回调 URL。</p>
+            <button id="start-login" class="action" data-i18n="auth.start">添加账号</button>
+            <div class="stack">
+              <label class="field">
+                <span data-i18n="auth.callbackLabel">手动回调 URL</span>
+                <input
+                  id="callback-url"
+                  name="callback_url"
+                  type="url"
+                  placeholder="如有需要，请粘贴 localhost:1455/auth/callback?... 到这里"
+                  data-i18n-placeholder="auth.callbackPlaceholder"
+                />
+              </label>
+              <button id="submit-callback-url" class="action secondary" type="button" data-i18n="auth.complete">完成登录</button>
+            </div>
+            <pre id="login-result" data-i18n="common.idle">空闲</pre>
+            </article>
+
+            <article class="card card-accent">
+              <p class="card-kicker" data-i18n="api.kicker">端点</p>
+              <h2 data-i18n="api.title">API 接入</h2>
+              <p class="subcopy small" data-i18n="api.subtitle">复制客户端最常用的接口地址。</p>
+              <div class="endpoint-list" id="api-config"></div>
+            </article>
+          </div>
+
+          <div class="stack-xl">
+            <article class="card card-compact">
+            <p class="card-kicker" data-i18n="diagnostics.kicker">诊断</p>
+            <h2 data-i18n="diagnostics.title">连接测试</h2>
+            <p class="subcopy small" data-i18n="diagnostics.subtitle">对当前最优可用目标执行一次真实诊断。</p>
+            <button id="run-test" class="action" data-i18n="diagnostics.run">运行测试</button>
+            <pre id="connection-test" data-i18n="common.idle">空闲</pre>
+            </article>
+
+            <article class="card card-compact">
+            <p class="card-kicker" data-i18n="codexApp.kicker">身份</p>
+            <h2 data-i18n="codexApp.title">Codex App</h2>
+            <p class="subcopy small" data-i18n-html="codexApp.subtitle">选择要写入 <code>~/.codex/auth.json</code> 的已保存账号，供 Codex App 使用。</p>
+            <div id="codex-app-card" class="detail-list" data-i18n="common.loading">加载中...</div>
+            </article>
+
+            <article class="card card-compact">
+            <p class="card-kicker" data-i18n="settings.kicker">路由</p>
+            <h2 data-i18n="settings.title">运行设置</h2>
+            <p class="subcopy small" data-i18n="settings.subtitle">无需手改环境变量文件，直接调整默认路由行为。</p>
+            <form id="runtime-settings" class="stack">
+              <label class="field">
+                <span data-i18n="settings.rotationMode">轮换模式</span>
+                <select id="rotation-mode" name="rotation_mode">
+                  <option value="least_used">least_used</option>
+                  <option value="round_robin">round_robin</option>
+                  <option value="sticky">sticky</option>
+                </select>
+              </label>
+              <label class="field">
+                <span data-i18n="settings.responsesTransport">Responses 传输方式</span>
+                <select id="responses-transport" name="responses_transport">
+                  <option value="auto">auto</option>
+                  <option value="http">http</option>
+                  <option value="websocket">websocket</option>
+                </select>
+              </label>
+              <button type="submit" class="action" data-i18n="settings.save">保存设置</button>
+            </form>
+            <pre id="settings-result" data-i18n="common.idle">空闲</pre>
+            </article>
+          </div>
+        </div>
+
+        <div class="overview-support-layout">
+          <div class="stack-xl">
+            <article class="card card-compact">
+              <p class="card-kicker" data-i18n="ops.kicker">运维</p>
+              <h2 data-i18n="ops.title">运行控制</h2>
+              <p class="subcopy small" data-i18n="ops.subtitle">需要最新状态时，可按需触发后台任务。</p>
+              <div class="actions-grid">
+                <button class="action secondary" data-job="quota_refresh" data-i18n="ops.refreshQuota">刷新额度</button>
+                <button class="action secondary" data-job="proxy_health" data-i18n="ops.checkProxies">检查代理</button>
+                <button class="action secondary" data-job="fingerprint_refresh" data-i18n="ops.refreshFingerprint">刷新指纹</button>
+                <button class="action secondary" data-job="token_refresh" data-i18n="ops.refreshTokens">刷新令牌</button>
+              </div>
+              <pre id="job-result" data-i18n="common.idle">空闲</pre>
+            </article>
+
+            <article class="card card-compact">
+              <p class="card-kicker" data-i18n="warnings.kicker">关注</p>
+              <h2 data-i18n="warnings.title">告警</h2>
+              <div id="warnings-list" class="list-block" data-i18n="common.loading">加载中...</div>
+            </article>
+          </div>
+
+          <div class="stack-xl">
+            <article class="card card-compact">
+              <p class="card-kicker" data-i18n="health.kicker">健康</p>
+              <h2 data-i18n="health.title">状态详情</h2>
+              <div id="status-details" class="detail-list" data-i18n="common.loading">加载中...</div>
+            </article>
+          </div>
+        </div>
+
+        <div class="grid">
+          <article class="card card-compact">
+            <p class="card-kicker" data-i18n="traffic.kicker">流量</p>
+            <h2 data-i18n="traffic.title">最近请求</h2>
+            <p class="subcopy small" data-i18n="traffic.subtitle">显示最近请求实际命中的账号；如果有用量数据，也会显示缓存命中率。</p>
+            <div id="recent-requests" class="list-block" data-i18n="common.loading">加载中...</div>
+          </article>
+        </div>
+
+      </section>
+
+      <section class="view-panel" data-view-panel="proxy-settings">
+        <section class="section-heading">
+          <div>
+            <p class="eyebrow" data-i18n="proxy.eyebrow">路由</p>
+            <h2 data-i18n="proxy.title">代理设置</h2>
+            <p class="subcopy small" data-i18n="proxy.subtitle">按健康状态查看代理，检查分配模式，并快速审阅账号路由。</p>
+          </div>
+          <div class="badge-row" id="proxy-summary-badges"></div>
+        </section>
+
+        <div class="split-layout">
+          <aside class="card sidebar-card">
+            <p class="card-kicker" data-i18n="proxy.filtersKicker">筛选</p>
+            <h2 data-i18n="proxy.groupsTitle">代理分组</h2>
+            <p class="subcopy small" data-i18n="proxy.groupsSubtitle">按默认模式或指定代理目标切分账号分配情况。</p>
+            <div id="proxy-groups" class="group-list" data-i18n="common.loading">加载中...</div>
+          </aside>
+
+          <div class="stack-lg">
+            <article class="card">
+              <p class="card-kicker" data-i18n="proxy.healthKicker">健康</p>
+              <h2 data-i18n="proxy.healthTitle">代理健康</h2>
+              <div id="proxies-list" class="proxy-grid" data-i18n="common.loading">加载中...</div>
+            </article>
+
+            <article class="card">
+              <p class="card-kicker" data-i18n="proxy.assignmentsKicker">分配</p>
+              <h2 data-i18n="proxy.assignmentsTitle">账号分配</h2>
+              <div id="proxy-accounts-table" class="table-shell" data-i18n="common.loading">加载中...</div>
+            </article>
+
+            <article class="card">
+              <p class="card-kicker" data-i18n="proxy.providersKicker">提供方</p>
+              <h2 data-i18n="proxy.providersTitle">中继提供方</h2>
+              <div id="relay-list" class="list-block" data-i18n="common.loading">加载中...</div>
+            </article>
+          </div>
+        </div>
+      </section>
+
+      <section class="view-panel" data-view-panel="usage-stats">
+        <section class="section-heading">
+          <div>
+            <p class="eyebrow" data-i18n="usage.eyebrow">分析</p>
+            <h2 data-i18n="usage.title">用量统计</h2>
+            <p class="subcopy small" data-i18n="usage.subtitle">用更紧凑的视觉层级查看 token 与请求趋势。</p>
+          </div>
+          <button id="refresh-usage" class="action ghost" data-i18n="usage.refresh">刷新用量</button>
+        </section>
+
+        <section class="summary-strip usage-summary">
+          <article class="stat">
+            <span class="stat-label" data-i18n="usage.inputTokens">输入 Tokens</span>
+            <strong id="usage-total-input">-</strong>
+            <span class="stat-meta" data-i18n="usage.latestTotal">已追踪账号的最新总量</span>
+          </article>
+          <article class="stat">
+            <span class="stat-label" data-i18n="usage.outputTokens">输出 Tokens</span>
+            <strong id="usage-total-output">-</strong>
+            <span class="stat-meta" data-i18n="usage.latestTotal">已追踪账号的最新总量</span>
+          </article>
+          <article class="stat">
+            <span class="stat-label" data-i18n="usage.requests">请求数</span>
+            <strong id="usage-total-requests">-</strong>
+            <span class="stat-meta" data-i18n="usage.latestTotal">已追踪账号的最新总量</span>
+          </article>
+          <article class="stat">
+            <span class="stat-label" data-i18n="usage.trackedAccounts">已追踪账号</span>
+            <strong id="usage-account-count">-</strong>
+            <span class="stat-meta" data-i18n="usage.trackedAccountsMeta">已有用量快照记录的账号</span>
+          </article>
+        </section>
+
+        <div class="grid usage-layout">
+          <article class="card">
+            <p class="card-kicker" data-i18n="usage.timelineKicker">时间线</p>
+            <h2 data-i18n="usage.timelineTitle">用量时间线</h2>
+            <div class="toggle-row" id="usage-granularity-controls">
+              <button class="chip is-active" data-granularity="hourly" data-i18n="usage.hourly">按小时</button>
+              <button class="chip" data-granularity="daily" data-i18n="usage.daily">按天</button>
+            </div>
+            <div class="toggle-row" id="usage-range-controls">
+              <button class="chip is-active" data-hours="24">24h</button>
+              <button class="chip" data-hours="72">72h</button>
+              <button class="chip" data-hours="168">7d</button>
+            </div>
+            <div id="usage-chart" class="chart-shell" data-i18n="common.loading">加载中...</div>
+          </article>
+
+          <article class="card">
+            <p class="card-kicker" data-i18n="usage.feedKicker">最近点位</p>
+            <h2 data-i18n="usage.feedTitle">用量明细</h2>
+            <div id="usage-feed" class="list-block" data-i18n="common.loading">加载中...</div>
+          </article>
+        </div>
+      </section>
+    </main>
+    <script type="module" src="/app.js"></script>
+  </body>
+</html>
