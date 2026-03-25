@@ -24,7 +24,7 @@ It also serves a lightweight dashboard for account management, proxy routing, us
 
 ### Main service
 
-- [app.py](/Users/xysheng/Desktop/codex/codex2gpt/app.py)
+- `app.py`
 
 This is the primary control center. It currently handles:
 
@@ -41,27 +41,27 @@ This is the primary control center. It currently handles:
 
 ### Helper modules
 
-- [codex2gpt/events.py](/Users/xysheng/Desktop/codex/codex2gpt/codex2gpt/events.py)
-- [codex2gpt/schema_utils.py](/Users/xysheng/Desktop/codex/codex2gpt/codex2gpt/schema_utils.py)
-- [codex2gpt/state_db.py](/Users/xysheng/Desktop/codex/codex2gpt/codex2gpt/state_db.py)
-- [codex2gpt/protocols/gemini.py](/Users/xysheng/Desktop/codex/codex2gpt/codex2gpt/protocols/gemini.py)
-- [codex2gpt/protocols/relay.py](/Users/xysheng/Desktop/codex/codex2gpt/codex2gpt/protocols/relay.py)
+- `codex2gpt/events.py`
+- `codex2gpt/schema_utils.py`
+- `codex2gpt/state_db.py`
+- `codex2gpt/protocols/gemini.py`
+- `codex2gpt/protocols/relay.py`
 
 ### Dashboard
 
-- [web/index.html](/Users/xysheng/Desktop/codex/codex2gpt/web/index.html)
-- [web/app.js](/Users/xysheng/Desktop/codex/codex2gpt/web/app.js)
-- [web/styles.css](/Users/xysheng/Desktop/codex/codex2gpt/web/styles.css)
+- `web/index.html`
+- `web/app.js`
+- `web/styles.css`
 
 The frontend is static and served by the same Python process.
 
 ### Tests
 
-- [tests/test_app.py](/Users/xysheng/Desktop/codex/codex2gpt/tests/test_app.py)
-- [tests/test_state_db.py](/Users/xysheng/Desktop/codex/codex2gpt/tests/test_state_db.py)
-- [tests/test_gemini_protocol.py](/Users/xysheng/Desktop/codex/codex2gpt/tests/test_gemini_protocol.py)
-- [tests/test_runtime_features.py](/Users/xysheng/Desktop/codex/codex2gpt/tests/test_runtime_features.py)
-- [tests/test_relay_protocol.py](/Users/xysheng/Desktop/codex/codex2gpt/tests/test_relay_protocol.py)
+- `tests/test_app.py`
+- `tests/test_state_db.py`
+- `tests/test_gemini_protocol.py`
+- `tests/test_runtime_features.py`
+- `tests/test_relay_protocol.py`
 
 ## Runtime State
 
@@ -122,8 +122,8 @@ The built-in dashboard currently covers:
 
 ## Recommended Reading Order
 
-1. [README.md](/Users/xysheng/Desktop/codex/codex2gpt/README.md)
-2. [AGENT_INTEGRATION.md](/Users/xysheng/Desktop/codex/codex2gpt/AGENT_INTEGRATION.md)
-3. [app.py](/Users/xysheng/Desktop/codex/codex2gpt/app.py)
-4. [codex2gpt/state_db.py](/Users/xysheng/Desktop/codex/codex2gpt/codex2gpt/state_db.py)
-5. [tests/test_runtime_features.py](/Users/xysheng/Desktop/codex/codex2gpt/tests/test_runtime_features.py)
+1. `README.md`
+2. `AGENT_INTEGRATION.md`
+3. `app.py`
+4. `codex2gpt/state_db.py`
+5. `tests/test_runtime_features.py`
