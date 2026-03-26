@@ -3164,6 +3164,11 @@ def normalize_anthropic_message_content(content, role):
         if not isinstance(block, dict):
             raise ProxyError(400, "invalid_request_error", f"{role} content block must be an object")
         block_type = str(block.get("type") or "").strip()
+        if block_type in {"thinking", "redacted_thinking"}:
+            if role != "assistant":
+                raise ProxyError(400, "invalid_request_error", f"{block_type} blocks are only supported in assistant messages")
+            normalized.append(block)
+            continue
         if block_type not in {"text", "tool_use", "tool_result"}:
             raise ProxyError(400, "invalid_request_error", f"unsupported {role} content block type: {block_type or 'unknown'}")
         normalized.append(block)
@@ -3218,6 +3223,10 @@ def anthropic_message_to_input_items(msg):
         block_type = block.get("type")
         if block_type == "text":
             buffered_text.append(anthropic_text_from_block(block, role))
+            continue
+        if block_type in {"thinking", "redacted_thinking"}:
+            # Claude clients may replay assistant reasoning blocks in history.
+            # Responses input does not accept prior reasoning items, so we safely skip them.
             continue
 
         flush_text()

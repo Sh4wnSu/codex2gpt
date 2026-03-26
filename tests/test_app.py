@@ -380,6 +380,34 @@ class Codex2GptCompatibilityTests(unittest.TestCase):
         finally:
             restore_auth_dir(tempdir, original_auth_dir)
 
+    def test_build_responses_payload_from_anthropic_ignores_assistant_thinking_blocks(self):
+        app, tempdir, original_auth_dir = load_app_module()
+        try:
+            requested_model, payload = app.build_responses_payload_from_anthropic(
+                {
+                    "model": "claude-opus-4-6",
+                    "max_tokens": 256,
+                    "messages": [
+                        {
+                            "role": "assistant",
+                            "content": [
+                                {"type": "thinking", "thinking": "先分析一下", "signature": "sig_1"},
+                                {"type": "redacted_thinking", "data": "opaque"},
+                                {"type": "text", "text": "我来继续处理"},
+                            ],
+                        },
+                        {"role": "user", "content": "继续"},
+                    ],
+                }
+            )
+            self.assertEqual(requested_model, "claude-opus-4-6")
+            self.assertEqual(payload["input"][0]["role"], "assistant")
+            self.assertEqual(payload["input"][0]["content"][0]["text"], "我来继续处理")
+            self.assertEqual(payload["input"][1]["role"], "user")
+            self.assertEqual(payload["input"][1]["content"][0]["text"], "继续")
+        finally:
+            restore_auth_dir(tempdir, original_auth_dir)
+
     def test_extract_session_context_supports_anthropic_business_fields(self):
         app, tempdir, original_auth_dir = load_app_module()
         try:
