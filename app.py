@@ -134,6 +134,26 @@ ANTHROPIC_MODEL_ALIASES = {
     "claude-haiku-4-5": "gpt-5.3-codex",
 }
 ANTHROPIC_SUPPORTED_MODELS = set(ANTHROPIC_MODEL_ALIASES) | {"gpt-5.4", "gpt-5.3-codex"}
+ANTHROPIC_SPEED_VALUES = {"standard", "fast"}
+ANTHROPIC_FAST_REASONING_EFFORT = "low"
+ANTHROPIC_BETA_CAPABILITY_PREFIXES = {
+    "structured_outputs": ("structured-outputs-",),
+    "effort": ("effort-",),
+    "task_budgets": ("task-budgets-",),
+    "context_management": ("context-management-",),
+    "fast_mode": ("fast-mode-",),
+    "connector_text": ("summarize-connector-text-",),
+    "tool_search": ("advanced-tool-use-", "tool-search-tool-"),
+}
+ANTHROPIC_BETA_CAPABILITY_LABELS = {
+    "structured_outputs": "structured-outputs-*",
+    "effort": "effort-*",
+    "task_budgets": "task-budgets-*",
+    "context_management": "context-management-*",
+    "fast_mode": "fast-mode-*",
+    "connector_text": "summarize-connector-text-*",
+    "tool_search": "advanced-tool-use-* or tool-search-tool-*",
+}
 GEMINI_ACTIONS = {"generateContent", "streamGenerateContent"}
 ANTHROPIC_ERROR_TYPES = {
     400: "invalid_request_error",
@@ -1653,6 +1673,15 @@ def is_curl_pipe_error(exc):
     if isinstance(exc, OSError) and getattr(exc, "errno", None) == errno.EPIPE:
         return True
     return "Broken pipe" in str(exc)
+
+
+def is_client_disconnect_error(exc):
+    if isinstance(exc, (BrokenPipeError, ConnectionResetError)):
+        return True
+    if isinstance(exc, OSError) and getattr(exc, "errno", None) in {errno.EPIPE, errno.ECONNRESET}:
+        return True
+    message = str(exc)
+    return "Broken pipe" in message or "Connection reset by peer" in message
 
 
 def upstream_request_with_transport_fallback(request, *, proxy_url=None, timeout=120, account_name=""):
@@ -3214,6 +3243,8 @@ def build_responses_payload_from_chat(raw_payload):
     reasoning_effort = raw_payload.get("reasoning_effort")
     if isinstance(reasoning_effort, str):
         effort = reasoning_effort.strip().lower()
+        if effort == "extra-high":
+            effort = "xhigh"
         if effort in REASONING_EFFORT_VALUES:
             payload["reasoning"] = {"effort": effort}
     tools = None
@@ -3242,6 +3273,31 @@ def anthropic_status_error_type(status: int):
     return ANTHROPIC_ERROR_TYPES.get(status, "api_error")
 
 
+def anthropic_supports_direct_gpt_model(model_name):
+    normalized = str(model_name or "").strip().lower()
+    return normalized.startswith("gpt-")
+
+
+def anthropic_speed_value(raw_payload):
+    if not isinstance(raw_payload, dict):
+        return None
+    speed = raw_payload.get("speed")
+    if not isinstance(speed, str):
+        return None
+    normalized = speed.strip().lower()
+    if normalized in ANTHROPIC_SPEED_VALUES:
+        return normalized
+    return None
+
+
+def anthropic_fast_model_name(model_name):
+    spec = resolve_model_spec(model_name)
+    effective_model = str(spec.get("effective_model") or model_name).strip()
+    if effective_model:
+        return effective_model
+    return str(model_name or "").strip()
+
+
 def normalize_anthropic_model(model):
     model_name = str(model or "").strip()
     if not model_name:
@@ -3251,14 +3307,20 @@ def normalize_anthropic_model(model):
     else:
         mapped = model_name
     mapped_spec = resolve_model_spec(mapped)
-    if mapped_spec["effective_model"] not in {"gpt-5.4", "gpt-5.3-codex"}:
+    effective_model = str(mapped_spec.get("effective_model") or "").strip()
+    direct_gpt_model = anthropic_supports_direct_gpt_model(model_name)
+    if not effective_model or not anthropic_supports_direct_gpt_model(effective_model):
         raise ProxyError(400, "invalid_request_error", f"unsupported model: {model_name}")
-    if model_name not in ANTHROPIC_SUPPORTED_MODELS and model_name not in MODEL_OVERRIDES:
+    if not direct_gpt_model and model_name not in ANTHROPIC_SUPPORTED_MODELS and model_name not in MODEL_OVERRIDES:
         raise ProxyError(400, "invalid_request_error", f"unsupported model: {model_name}")
     return model_name, mapped
 
 
-def anthropic_budget_model(model_name):
+def anthropic_budget_model(model_name, translated_payload=None):
+    if isinstance(translated_payload, dict):
+        translated_model = str(translated_payload.get("model") or "").strip()
+        if translated_model:
+            return translated_model
     name = str(model_name or "").strip()
     if not name:
         return DEFAULT_MODEL
@@ -3318,24 +3380,193 @@ def normalize_anthropic_message_content(content, role):
                 raise ProxyError(400, "invalid_request_error", f"{block_type} blocks are only supported in assistant messages")
             normalized.append(block)
             continue
-        if block_type not in {"text", "tool_use", "tool_result"}:
+        if block_type not in {"text", "tool_use", "tool_result", "image", "document", "server_tool_use", "connector_text"}:
             raise ProxyError(400, "invalid_request_error", f"unsupported {role} content block type: {block_type or 'unknown'}")
         normalized.append(block)
     return normalized
 
 
-def anthropic_tool_result_text(content):
+def normalized_input_filename(name, default_name):
+    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", str(name or "").strip()).strip("._-")
+    if cleaned:
+        return cleaned[:120]
+    return default_name
+
+
+def default_filename_for_media_type(media_type, prefix="document"):
+    extension = mimetypes.guess_extension(str(media_type or "").strip(), strict=False) or ""
+    if extension == ".jpe":
+        extension = ".jpg"
+    return f"{prefix}{extension or '.bin'}"
+
+
+def anthropic_image_block_to_input_image(block, context):
+    if not isinstance(block, dict):
+        raise ProxyError(400, "invalid_request_error", f"{context} image block must be an object")
+    source = block.get("source")
+    if not isinstance(source, dict):
+        raise ProxyError(400, "invalid_request_error", f"{context} image blocks must include a source object")
+    source_type = str(source.get("type") or "").strip()
+    if source_type == "base64":
+        media_type = str(source.get("media_type") or "").strip()
+        data = str(source.get("data") or "").strip()
+        if not media_type or not data:
+            raise ProxyError(
+                400,
+                "invalid_request_error",
+                f"{context} base64 image blocks must include media_type and data",
+            )
+        return {"type": "input_image", "image_url": f"data:{media_type};base64,{data}", "detail": "auto"}
+    if source_type == "url":
+        image_url = str(source.get("url") or "").strip()
+        if not image_url:
+            raise ProxyError(400, "invalid_request_error", f"{context} url image blocks must include url")
+        return {"type": "input_image", "image_url": image_url, "detail": "auto"}
+    raise ProxyError(400, "invalid_request_error", f"unsupported {context} image source type: {source_type or 'unknown'}")
+
+
+def anthropic_document_block_to_input_file(block, context):
+    if not isinstance(block, dict):
+        raise ProxyError(400, "invalid_request_error", f"{context} document block must be an object")
+    source = block.get("source")
+    if not isinstance(source, dict):
+        raise ProxyError(400, "invalid_request_error", f"{context} document blocks must include a source object")
+
+    source_type = str(source.get("type") or "").strip()
+    title = block.get("title")
+    if source_type == "base64":
+        media_type = str(source.get("media_type") or "").strip()
+        data = str(source.get("data") or "").strip()
+        if not media_type or not data:
+            raise ProxyError(
+                400,
+                "invalid_request_error",
+                f"{context} base64 document blocks must include media_type and data",
+            )
+        filename = normalized_input_filename(title, default_filename_for_media_type(media_type))
+        return {
+            "type": "input_file",
+            "filename": filename,
+            "file_data": f"data:{media_type};base64,{data}",
+        }
+    if source_type == "url":
+        file_url = str(source.get("url") or "").strip()
+        if not file_url:
+            raise ProxyError(400, "invalid_request_error", f"{context} url document blocks must include url")
+        payload = {"type": "input_file", "file_url": file_url}
+        if isinstance(title, str) and title.strip():
+            payload["filename"] = normalized_input_filename(title, default_filename_for_media_type("application/pdf"))
+        return payload
+    if source_type == "file":
+        file_id = str(source.get("file_id") or "").strip()
+        if not file_id:
+            raise ProxyError(400, "invalid_request_error", f"{context} file document blocks must include file_id")
+        return {"type": "input_file", "file_id": file_id}
+    if source_type == "text":
+        media_type = str(source.get("media_type") or "").strip()
+        data = source.get("data")
+        if media_type != "text/plain" or not isinstance(data, str):
+            raise ProxyError(
+                400,
+                "invalid_request_error",
+                f"{context} text document blocks must include text/plain data",
+            )
+        encoded = base64.b64encode(data.encode("utf-8")).decode("ascii")
+        filename = normalized_input_filename(title, default_filename_for_media_type(media_type))
+        return {
+            "type": "input_file",
+            "filename": filename,
+            "file_data": f"data:{media_type};base64,{encoded}",
+        }
+    raise ProxyError(
+        400,
+        "invalid_request_error",
+        f"unsupported {context} document source type: {source_type or 'unknown'}",
+    )
+
+
+def anthropic_beta_enabled(enabled_betas, capability):
+    prefixes = ANTHROPIC_BETA_CAPABILITY_PREFIXES.get(capability) or ()
+    if not prefixes:
+        return False
+    for beta in enabled_betas or ():
+        normalized = str(beta or "").strip().lower()
+        if any(normalized.startswith(prefix) for prefix in prefixes):
+            return True
+    return False
+
+
+def require_anthropic_beta(enabled_betas, capability, field_name):
+    expected = ANTHROPIC_BETA_CAPABILITY_LABELS.get(capability) or capability
+    raise ProxyError(
+        400,
+        "invalid_request_error",
+        f"{field_name} requires anthropic-beta: {expected}",
+    )
+
+
+def anthropic_tool_result_text(content, enabled_betas=None):
+    enforce_betas = enabled_betas is not None
     if isinstance(content, str):
         return content
     if isinstance(content, list):
         parts = []
         for block in content:
-            parts.append(anthropic_text_from_block(block, "tool_result"))
-        return "".join(parts)
+            if not isinstance(block, dict):
+                raise ProxyError(400, "invalid_request_error", "tool_result content blocks must be objects")
+            block_type = str(block.get("type") or "").strip()
+            if block_type == "text":
+                parts.append(anthropic_text_from_block(block, "tool_result"))
+                continue
+            if block_type == "tool_reference":
+                if enforce_betas and not anthropic_beta_enabled(enabled_betas, "tool_search"):
+                    require_anthropic_beta(enabled_betas, "tool_search", "tool_reference blocks")
+                tool_name = str(block.get("tool_name") or "").strip()
+                if not tool_name:
+                    raise ProxyError(400, "invalid_request_error", "tool_reference blocks must include tool_name")
+                parts.append(f"[Tool reference: {tool_name}]")
+                continue
+            if block_type == "image":
+                parts.append("[Image result]")
+                continue
+            if block_type == "document":
+                title = str(block.get("title") or "").strip()
+                if title:
+                    parts.append(f"[Document result: {title}]")
+                else:
+                    parts.append("[Document result]")
+                continue
+            raise ProxyError(400, "invalid_request_error", f"unsupported tool_result content block type: {block_type or 'unknown'}")
+        return "\n".join(part for part in parts if part)
     raise ProxyError(400, "invalid_request_error", "tool_result.content must be a string or list of text blocks")
 
 
-def anthropic_message_to_input_items(msg):
+def anthropic_connector_text(block, context):
+    if not isinstance(block, dict):
+        raise ProxyError(400, "invalid_request_error", f"{context} connector_text block must be an object")
+    text = block.get("connector_text")
+    if not isinstance(text, str):
+        raise ProxyError(400, "invalid_request_error", f"{context} connector_text block must include connector_text")
+    return text
+
+
+def anthropic_server_tool_use_text(block):
+    if not isinstance(block, dict):
+        raise ProxyError(400, "invalid_request_error", "server_tool_use blocks must be objects")
+    name = str(block.get("name") or "").strip()
+    if not name:
+        raise ProxyError(400, "invalid_request_error", "server_tool_use blocks must include name")
+    tool_input = block.get("input")
+    if tool_input is None:
+        return f"[Server tool use: {name}]"
+    try:
+        serialized = json.dumps(tool_input, ensure_ascii=False, separators=(",", ":"))
+    except (TypeError, ValueError):
+        serialized = str(tool_input)
+    return f"[Server tool use: {name} {serialized}]"
+
+
+def anthropic_message_to_input_items(msg, enabled_betas=None):
     if not isinstance(msg, dict):
         raise ProxyError(400, "invalid_request_error", "messages entries must be objects")
     role = str(msg.get("role") or "").strip()
@@ -3343,18 +3574,18 @@ def anthropic_message_to_input_items(msg):
         raise ProxyError(400, "invalid_request_error", f"unsupported role: {role or 'unknown'}")
     content_blocks = normalize_anthropic_message_content(msg.get("content"), role)
     input_items = []
-    buffered_text = []
+    buffered_content = []
 
-    def flush_text():
-        nonlocal buffered_text
-        if not buffered_text:
+    def flush_message():
+        nonlocal buffered_content
+        if not buffered_content:
             return
         if role == "user":
             input_items.append(
                 {
                     "type": "message",
                     "role": "user",
-                    "content": [{"type": "input_text", "text": text} for text in buffered_text],
+                    "content": list(buffered_content),
                 }
             )
         else:
@@ -3363,22 +3594,48 @@ def anthropic_message_to_input_items(msg):
                     "type": "message",
                     "role": "assistant",
                     "status": "completed",
-                    "content": [{"type": "output_text", "text": text, "annotations": []} for text in buffered_text],
+                    "content": [{"type": "output_text", "text": text, "annotations": []} for text in buffered_content],
                 }
             )
-        buffered_text = []
+        buffered_content = []
 
     for block in content_blocks:
         block_type = block.get("type")
         if block_type == "text":
-            buffered_text.append(anthropic_text_from_block(block, role))
+            text = anthropic_text_from_block(block, role)
+            if role == "user":
+                buffered_content.append({"type": "input_text", "text": text})
+            else:
+                buffered_content.append(text)
+            continue
+        if block_type == "connector_text":
+            text = anthropic_connector_text(block, role)
+            if role == "user":
+                buffered_content.append({"type": "input_text", "text": text})
+            else:
+                buffered_content.append(text)
+            continue
+        if block_type == "server_tool_use":
+            if role != "assistant":
+                raise ProxyError(400, "invalid_request_error", "server_tool_use blocks are only supported in assistant messages")
+            buffered_content.append(anthropic_server_tool_use_text(block))
+            continue
+        if block_type == "image":
+            if role != "user":
+                raise ProxyError(400, "invalid_request_error", "image blocks are only supported in user messages")
+            buffered_content.append(anthropic_image_block_to_input_image(block, role))
+            continue
+        if block_type == "document":
+            if role != "user":
+                raise ProxyError(400, "invalid_request_error", "document blocks are only supported in user messages")
+            buffered_content.append(anthropic_document_block_to_input_file(block, role))
             continue
         if block_type in {"thinking", "redacted_thinking"}:
             # Claude clients may replay assistant reasoning blocks in history.
             # Responses input does not accept prior reasoning items, so we safely skip them.
             continue
 
-        flush_text()
+        flush_message()
         if block_type == "tool_use":
             if role != "assistant":
                 raise ProxyError(400, "invalid_request_error", "tool_use blocks are only supported in assistant messages")
@@ -3410,19 +3667,20 @@ def anthropic_message_to_input_items(msg):
             {
                 "type": "function_call_output",
                 "call_id": call_id,
-                "output": anthropic_tool_result_text(block.get("content")),
+                "output": anthropic_tool_result_text(block.get("content"), enabled_betas=enabled_betas),
             }
         )
 
-    flush_text()
+    flush_message()
     return input_items
 
 
-def normalize_anthropic_tools(tools):
+def normalize_anthropic_tools(tools, enabled_betas=None):
     if tools is None:
         return None
     if not isinstance(tools, list):
         raise ProxyError(400, "invalid_request_error", "tools must be a list")
+    enforce_betas = enabled_betas is not None
     normalized = []
     for tool in tools:
         if not isinstance(tool, dict):
@@ -3435,6 +3693,9 @@ def normalize_anthropic_tools(tools):
             input_schema = {"type": "object", "properties": {}}
         if not isinstance(input_schema, dict):
             raise ProxyError(400, "invalid_request_error", "tool input_schema must be an object")
+        if enforce_betas and ("defer_loading" in tool or "eager_input_streaming" in tool):
+            if not anthropic_beta_enabled(enabled_betas, "tool_search"):
+                require_anthropic_beta(enabled_betas, "tool_search", "tool schema extras")
         normalized.append(
             {
                 "type": "function",
@@ -3472,8 +3733,13 @@ def anthropic_tool_choice_to_responses(tool_choice):
 
 
 def anthropic_thinking_to_reasoning(thinking):
-    if not isinstance(thinking, dict):
+    if thinking is None:
         return None
+    if not isinstance(thinking, dict):
+        raise ProxyError(400, "invalid_request_error", "thinking must be an object")
+    thinking_type = str(thinking.get("type") or "").strip().lower()
+    if thinking_type == "adaptive":
+        return {"effort": DEFAULT_REASONING_EFFORT}
     budget = thinking.get("budget_tokens")
     try:
         budget = int(budget)
@@ -3492,9 +3758,97 @@ def anthropic_thinking_to_reasoning(thinking):
     return {"effort": effort}
 
 
-def build_responses_payload_from_anthropic(raw_payload):
+def anthropic_thinking_enabled(thinking):
+    if not isinstance(thinking, dict):
+        return False
+    thinking_type = str(thinking.get("type") or "").strip().lower()
+    if thinking_type in {"adaptive", "enabled"}:
+        return True
+    if bool(thinking.get("enabled")):
+        return True
+    budget = thinking.get("budget_tokens")
+    try:
+        return int(budget) > 0
+    except (TypeError, ValueError):
+        return False
+
+
+def normalize_anthropic_output_format(format_value):
+    if format_value is None:
+        return None
+    if not is_record(format_value):
+        raise ProxyError(400, "invalid_request_error", "output_config.format must be an object")
+    format_type = str(format_value.get("type") or "").strip()
+    if format_type == "json_object":
+        return {"format": {"type": "json_object"}}
+    if format_type != "json_schema":
+        raise ProxyError(400, "invalid_request_error", f"unsupported output_config.format type: {format_type or 'unknown'}")
+    schema = format_value.get("schema")
+    if not is_record(schema):
+        raise ProxyError(400, "invalid_request_error", "output_config.format.schema must be an object")
+    normalized_schema = prepare_json_schema(schema)
+    text_format = {
+        "type": "json_schema",
+        "name": str(format_value.get("name") or "structured_output"),
+        "schema": normalized_schema,
+    }
+    if "strict" in format_value:
+        text_format["strict"] = bool(format_value.get("strict"))
+    return {"format": text_format}
+
+
+def normalize_anthropic_output_config(output_config, enabled_betas=None):
+    if output_config is None:
+        return None, None
+    if not is_record(output_config):
+        raise ProxyError(400, "invalid_request_error", "output_config must be an object")
+    enforce_betas = enabled_betas is not None
+    format_value = output_config.get("format")
+    if format_value is not None and enforce_betas and not anthropic_beta_enabled(enabled_betas, "structured_outputs"):
+        require_anthropic_beta(enabled_betas, "structured_outputs", "output_config.format")
+    text = normalize_anthropic_output_format(format_value)
+    effort = output_config.get("effort")
+    reasoning = None
+    if effort is not None:
+        if enforce_betas and not anthropic_beta_enabled(enabled_betas, "effort"):
+            require_anthropic_beta(enabled_betas, "effort", "output_config.effort")
+        if not isinstance(effort, str):
+            raise ProxyError(400, "invalid_request_error", "output_config.effort must be a string")
+        normalized_effort = effort.strip().lower()
+        if normalized_effort == "extra-high":
+            normalized_effort = "xhigh"
+        if normalized_effort not in REASONING_EFFORT_VALUES:
+            raise ProxyError(400, "invalid_request_error", f"unsupported output_config.effort: {effort}")
+        reasoning = {"effort": normalized_effort}
+    task_budget = output_config.get("task_budget")
+    if task_budget is not None:
+        if enforce_betas and not anthropic_beta_enabled(enabled_betas, "task_budgets"):
+            require_anthropic_beta(enabled_betas, "task_budgets", "output_config.task_budget")
+        if not is_record(task_budget):
+            raise ProxyError(400, "invalid_request_error", "output_config.task_budget must be an object")
+        if str(task_budget.get("type") or "").strip() != "tokens":
+            raise ProxyError(400, "invalid_request_error", "output_config.task_budget.type must be 'tokens'")
+        try:
+            total = int(task_budget.get("total"))
+        except (TypeError, ValueError):
+            total = 0
+        if total <= 0:
+            raise ProxyError(400, "invalid_request_error", "output_config.task_budget.total must be a positive integer")
+        if "remaining" in task_budget and task_budget.get("remaining") is not None:
+            try:
+                remaining = int(task_budget.get("remaining"))
+            except (TypeError, ValueError):
+                remaining = -1
+            if remaining < 0:
+                raise ProxyError(400, "invalid_request_error", "output_config.task_budget.remaining must be a non-negative integer")
+    return text, reasoning
+
+
+def normalize_anthropic_request(raw_payload, enabled_betas=None):
     if not isinstance(raw_payload, dict):
         raise ProxyError(400, "invalid_request_error", "request body must be an object")
+    if enabled_betas is not None:
+        enabled_betas = {str(beta or "").strip().lower() for beta in enabled_betas if str(beta or "").strip()}
 
     requested_model, mapped_model = normalize_anthropic_model(raw_payload.get("model"))
     require_anthropic_max_tokens(raw_payload)
@@ -3504,34 +3858,81 @@ def build_responses_payload_from_anthropic(raw_payload):
 
     input_items = []
     for msg in messages:
-        input_items.extend(anthropic_message_to_input_items(msg))
+        input_items.extend(anthropic_message_to_input_items(msg, enabled_betas=enabled_betas))
     if not input_items:
         input_items = normalize_input("")
 
-    payload = strip_unsupported_top_level_fields(raw_payload)
-    payload.pop("messages", None)
-    payload.pop("system", None)
-    payload.pop("tools", None)
-    payload.pop("tool_choice", None)
-    payload["model"] = mapped_model
-    payload["input"] = input_items
+    payload = {"model": mapped_model, "input": input_items}
+    prompt_cache_key = raw_payload.get("prompt_cache_key")
+    if isinstance(prompt_cache_key, str) and prompt_cache_key.strip():
+        payload["prompt_cache_key"] = prompt_cache_key.strip()
 
     instructions = normalize_anthropic_system(raw_payload.get("system"))
     if instructions:
         payload["instructions"] = instructions
 
-    tools = normalize_anthropic_tools(raw_payload.get("tools"))
+    tools = normalize_anthropic_tools(raw_payload.get("tools"), enabled_betas=enabled_betas)
     if tools is not None:
         payload["tools"] = tools
 
     tool_choice = anthropic_tool_choice_to_responses(raw_payload.get("tool_choice"))
     if tool_choice is not None:
         payload["tool_choice"] = tool_choice
-    reasoning = anthropic_thinking_to_reasoning(raw_payload.get("thinking"))
+
+    if raw_payload.get("context_management") is not None:
+        if enabled_betas is not None and not anthropic_beta_enabled(enabled_betas, "context_management"):
+            require_anthropic_beta(enabled_betas, "context_management", "context_management")
+        if not is_record(raw_payload.get("context_management")):
+            raise ProxyError(400, "invalid_request_error", "context_management must be an object")
+
+    requested_speed = raw_payload.get("speed")
+    normalized_speed = None
+    if requested_speed is not None:
+        if not isinstance(requested_speed, str):
+            raise ProxyError(400, "invalid_request_error", "speed must be a string")
+        normalized_speed = requested_speed.strip().lower()
+        if normalized_speed not in ANTHROPIC_SPEED_VALUES:
+            raise ProxyError(400, "invalid_request_error", f"unsupported speed: {requested_speed}")
+        if normalized_speed == "fast" and enabled_betas is not None and not anthropic_beta_enabled(enabled_betas, "fast_mode"):
+            require_anthropic_beta(enabled_betas, "fast_mode", "speed=fast")
+
+    text, reasoning = normalize_anthropic_output_config(raw_payload.get("output_config"), enabled_betas=enabled_betas)
+    if reasoning is None:
+        reasoning = anthropic_thinking_to_reasoning(raw_payload.get("thinking"))
+    if normalized_speed == "fast":
+        payload["model"] = anthropic_fast_model_name(payload["model"])
+        if reasoning is None:
+            reasoning = {"effort": ANTHROPIC_FAST_REASONING_EFFORT}
+    if text is not None:
+        payload["text"] = text
     if reasoning is not None:
         payload["reasoning"] = reasoning
+    return requested_model, payload
 
+
+def build_responses_payload_from_anthropic(raw_payload, enabled_betas=None):
+    requested_model, payload = normalize_anthropic_request(raw_payload, enabled_betas=enabled_betas)
     return requested_model, normalize_payload(payload)
+
+
+def normalize_anthropic_beta_entries(value):
+    entries = []
+    if isinstance(value, str):
+        entries.extend(part.strip().lower() for part in value.split(","))
+    elif isinstance(value, (list, tuple, set)):
+        for item in value:
+            if isinstance(item, str):
+                entries.extend(part.strip().lower() for part in item.split(","))
+    return {entry for entry in entries if entry}
+
+
+def extract_anthropic_enabled_betas(headers=None, raw_payload=None):
+    enabled = set()
+    enabled.update(normalize_anthropic_beta_entries(extract_header_value(headers, "anthropic-beta")))
+    if isinstance(raw_payload, dict):
+        enabled.update(normalize_anthropic_beta_entries(raw_payload.get("betas")))
+        enabled.update(normalize_anthropic_beta_entries(raw_payload.get("anthropic_beta")))
+    return enabled
 
 
 def extract_header_value(headers, *names):
@@ -3643,6 +4044,9 @@ def estimate_input_tokens(value):
     if isinstance(value, str):
         return estimate_text_tokens(value)
     if isinstance(value, dict):
+        item_type = str(value.get("type") or "").strip()
+        if item_type in {"input_image", "input_file"}:
+            return 2000 + estimate_text_tokens(value.get("filename", ""))
         total = 0
         for key, current in value.items():
             total += estimate_text_tokens(key)
@@ -3660,6 +4064,10 @@ def estimate_request_tokens(payload):
     total += estimate_text_tokens(payload.get("model", ""))
     total += estimate_text_tokens(payload.get("instructions", ""))
     total += estimate_input_tokens(payload.get("input"))
+    total += estimate_input_tokens(payload.get("tools"))
+    total += estimate_input_tokens(payload.get("tool_choice"))
+    total += estimate_input_tokens(payload.get("text"))
+    total += estimate_input_tokens(payload.get("reasoning"))
     # Keep a small fixed overhead for roles/types/message wrappers.
     return total + 32
 
@@ -3835,7 +4243,7 @@ def chat_completion_usage_chunk_from_response(response):
     }
 
 
-def anthropic_usage_from_response(response, include_output_tokens=True):
+def anthropic_usage_from_response(response, include_output_tokens=True, requested_speed=None):
     usage = response.get("usage") or {}
     input_tokens = int(usage.get("input_tokens") or 0)
     output_tokens = int(usage.get("output_tokens") or 0)
@@ -3843,6 +4251,8 @@ def anthropic_usage_from_response(response, include_output_tokens=True):
     cached_tokens = int((usage.get("input_tokens_details") or {}).get("cached_tokens") or 0)
     if cached_tokens:
         payload["cache_read_input_tokens"] = cached_tokens
+    if requested_speed == "fast":
+        payload["speed"] = "fast"
     return payload
 
 
@@ -3889,7 +4299,7 @@ def anthropic_stop_reason(response, content_blocks):
     return "end_turn"
 
 
-def response_to_anthropic_message(response, requested_model):
+def response_to_anthropic_message(response, requested_model, requested_speed=None):
     content_blocks = response_to_anthropic_content_blocks(response)
     return {
         "id": response.get("id", f"msg_{int(time.time())}"),
@@ -3899,7 +4309,7 @@ def response_to_anthropic_message(response, requested_model):
         "content": content_blocks,
         "stop_reason": anthropic_stop_reason(response, content_blocks),
         "stop_sequence": None,
-        "usage": anthropic_usage_from_response(response),
+        "usage": anthropic_usage_from_response(response, requested_speed=requested_speed),
     }
 
 
@@ -3907,7 +4317,7 @@ def anthropic_sse_event(name, payload):
     return f"event: {name}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
 
-def anthropic_sse_body_from_message(message_payload):
+def anthropic_sse_body_from_message(message_payload, *, connector_text_mode=False):
     frames = [
         anthropic_sse_event(
             "message_start",
@@ -3924,7 +4334,7 @@ def anthropic_sse_body_from_message(message_payload):
                     "usage": {
                         key: value
                         for key, value in message_payload["usage"].items()
-                        if key in {"input_tokens", "cache_read_input_tokens"}
+                        if key in {"input_tokens", "cache_read_input_tokens", "speed"}
                     }
                     | {"output_tokens": 0},
                 },
@@ -3936,15 +4346,42 @@ def anthropic_sse_body_from_message(message_payload):
             frames.append(
                 anthropic_sse_event(
                     "content_block_start",
-                    {"type": "content_block_start", "index": index, "content_block": {"type": "text", "text": ""}},
+                    {
+                        "type": "content_block_start",
+                        "index": index,
+                        "content_block": (
+                            {"type": "connector_text", "connector_text": "", "signature": ""}
+                            if connector_text_mode
+                            else {"type": "text", "text": ""}
+                        ),
+                    },
                 )
             )
             frames.append(
                 anthropic_sse_event(
                     "content_block_delta",
-                    {"type": "content_block_delta", "index": index, "delta": {"type": "text_delta", "text": block["text"]}},
+                    {
+                        "type": "content_block_delta",
+                        "index": index,
+                        "delta": (
+                            {"type": "connector_text_delta", "connector_text": block["text"]}
+                            if connector_text_mode
+                            else {"type": "text_delta", "text": block["text"]}
+                        ),
+                    },
                 )
             )
+            if connector_text_mode:
+                frames.append(
+                    anthropic_sse_event(
+                        "content_block_delta",
+                        {
+                            "type": "content_block_delta",
+                            "index": index,
+                            "delta": {"type": "signature_delta", "signature": ""},
+                        },
+                    )
+                )
         else:
             frames.append(
                 anthropic_sse_event(
@@ -3976,7 +4413,10 @@ def anthropic_sse_body_from_message(message_payload):
             {
                 "type": "message_delta",
                 "delta": {"stop_reason": message_payload["stop_reason"], "stop_sequence": message_payload["stop_sequence"]},
-                "usage": {"output_tokens": message_payload["usage"].get("output_tokens", 0)},
+                "usage": {
+                    "output_tokens": message_payload["usage"].get("output_tokens", 0),
+                    **({"speed": "fast"} if message_payload["usage"].get("speed") == "fast" else {}),
+                },
             },
         )
     )
@@ -4193,11 +4633,13 @@ def iter_chat_completion_sse(upstream, model, include_usage=False, include_reaso
     yield b"data: [DONE]\n\n"
 
 
-def iter_anthropic_message_sse(upstream, model, include_thinking=False):
+def iter_anthropic_message_sse(upstream, model, include_thinking=False, connector_text_mode=False, requested_speed=None):
     message_id = f"msg_{uuid.uuid4().hex[:24]}"
     usage = {"input_tokens": 0, "output_tokens": 0}
+    if requested_speed == "fast":
+        usage["speed"] = "fast"
     content_index = 0
-    text_block_open = False
+    text_block_kind = None
     thinking_block_open = False
     saw_tool = False
     emitted_call_deltas = set()
@@ -4214,27 +4656,49 @@ def iter_anthropic_message_sse(upstream, model, include_thinking=False):
                 "content": [],
                 "stop_reason": None,
                 "stop_sequence": None,
-                "usage": {"input_tokens": 0, "output_tokens": 0},
+                "usage": usage.copy(),
             },
         },
     )
 
     def close_text():
-        nonlocal text_block_open, content_index
-        if text_block_open:
-            text_block_open = False
+        nonlocal text_block_kind, content_index
+        if text_block_kind is not None:
+            frames = []
+            if text_block_kind == "connector_text":
+                frames.append(
+                    anthropic_sse_event_bytes(
+                        "content_block_delta",
+                        {
+                            "type": "content_block_delta",
+                            "index": content_index,
+                            "delta": {"type": "signature_delta", "signature": ""},
+                        },
+                    )
+                )
+            text_block_kind = None
             frame = anthropic_sse_event_bytes("content_block_stop", {"type": "content_block_stop", "index": content_index})
             content_index += 1
-            return [frame]
+            return frames + [frame]
         return []
 
     def close_thinking():
         nonlocal thinking_block_open, content_index
         if thinking_block_open:
+            frames = [
+                anthropic_sse_event_bytes(
+                    "content_block_delta",
+                    {
+                        "type": "content_block_delta",
+                        "index": content_index,
+                        "delta": {"type": "signature_delta", "signature": ""},
+                    },
+                )
+            ]
             thinking_block_open = False
             frame = anthropic_sse_event_bytes("content_block_stop", {"type": "content_block_stop", "index": content_index})
             content_index += 1
-            return [frame]
+            return frames + [frame]
         return []
 
     for detail in iter_upstream_extracted_events(upstream):
@@ -4262,7 +4726,11 @@ def iter_anthropic_message_sse(upstream, model, include_thinking=False):
             if not thinking_block_open:
                 yield anthropic_sse_event_bytes(
                     "content_block_start",
-                    {"type": "content_block_start", "index": content_index, "content_block": {"type": "thinking", "thinking": ""}},
+                    {
+                        "type": "content_block_start",
+                        "index": content_index,
+                        "content_block": {"type": "thinking", "thinking": "", "signature": ""},
+                    },
                 )
                 thinking_block_open = True
             yield anthropic_sse_event_bytes(
@@ -4317,18 +4785,30 @@ def iter_anthropic_message_sse(upstream, model, include_thinking=False):
         if detail["text_delta"]:
             for frame in close_thinking():
                 yield frame
-            if not text_block_open:
+            if text_block_kind is None:
                 yield anthropic_sse_event_bytes(
                     "content_block_start",
-                    {"type": "content_block_start", "index": content_index, "content_block": {"type": "text", "text": ""}},
+                    {
+                        "type": "content_block_start",
+                        "index": content_index,
+                        "content_block": (
+                            {"type": "connector_text", "connector_text": "", "signature": ""}
+                            if connector_text_mode
+                            else {"type": "text", "text": ""}
+                        ),
+                    },
                 )
-                text_block_open = True
+                text_block_kind = "connector_text" if connector_text_mode else "text"
             yield anthropic_sse_event_bytes(
                 "content_block_delta",
                 {
                     "type": "content_block_delta",
                     "index": content_index,
-                    "delta": {"type": "text_delta", "text": detail["text_delta"]},
+                    "delta": (
+                        {"type": "connector_text_delta", "connector_text": detail["text_delta"]}
+                        if connector_text_mode
+                        else {"type": "text_delta", "text": detail["text_delta"]}
+                    ),
                 },
             )
         if detail["event"] == "response.completed" and detail["usage"]:
@@ -4338,6 +4818,8 @@ def iter_anthropic_message_sse(upstream, model, include_thinking=False):
             }
             if detail["usage"].get("cached_tokens") is not None:
                 usage["cache_read_input_tokens"] = int(detail["usage"].get("cached_tokens") or 0)
+            if requested_speed == "fast":
+                usage["speed"] = "fast"
 
     for frame in close_thinking() + close_text():
         yield frame
@@ -4346,7 +4828,10 @@ def iter_anthropic_message_sse(upstream, model, include_thinking=False):
         {
             "type": "message_delta",
             "delta": {"stop_reason": "tool_use" if saw_tool else "end_turn", "stop_sequence": None},
-            "usage": {"output_tokens": usage.get("output_tokens", 0)},
+            "usage": {
+                "output_tokens": usage.get("output_tokens", 0),
+                **({"speed": "fast"} if usage.get("speed") == "fast" else {}),
+            },
         },
     )
     yield anthropic_sse_event_bytes("message_stop", {"type": "message_stop"})
@@ -5322,6 +5807,8 @@ class Handler(BaseHTTPRequestHandler):
             except urllib.error.HTTPError as exc:
                 self._forward_http_error(exc)
             except Exception as exc:
+                if is_client_disconnect_error(exc):
+                    return
                 self._write_json(502, {"error": {"type": "upstream_error", "message": str(exc)}})
             return
 
@@ -5331,7 +5818,8 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 self._require_anthropic_version()
                 raw_payload = self._read_json()
-                _, payload = build_responses_payload_from_anthropic(raw_payload)
+                enabled_betas = extract_anthropic_enabled_betas(self.headers, raw_payload)
+                _, payload = build_responses_payload_from_anthropic(raw_payload, enabled_betas=enabled_betas)
             except ProxyError as exc:
                 self._write_anthropic_error(exc.status, exc.error_type, exc.message)
                 return
@@ -5348,10 +5836,15 @@ class Handler(BaseHTTPRequestHandler):
             payload = {}
             session_context = {}
             requested_model = ""
+            connector_text_mode = False
+            requested_speed = None
             try:
                 self._require_anthropic_version()
                 raw_payload = self._read_json()
-                requested_model, payload = build_responses_payload_from_anthropic(raw_payload)
+                enabled_betas = extract_anthropic_enabled_betas(self.headers, raw_payload)
+                requested_model, payload = build_responses_payload_from_anthropic(raw_payload, enabled_betas=enabled_betas)
+                connector_text_mode = anthropic_beta_enabled(enabled_betas, "connector_text")
+                requested_speed = anthropic_speed_value(raw_payload)
                 session_context = extract_session_context(self.headers, raw_payload, self.client_address[0])
                 session_key = session_context["session_key"]
                 ensure_prompt_cache_key(payload, session_key)
@@ -5388,7 +5881,7 @@ class Handler(BaseHTTPRequestHandler):
                 return
 
             estimated_tokens, budget_spec, budget_error = validate_context_budget(
-                payload, requested_model=anthropic_budget_model(requested_model)
+                payload, requested_model=anthropic_budget_model(requested_model, payload)
             )
             if budget_error:
                 self._record_failed_transcript(
@@ -5422,12 +5915,19 @@ class Handler(BaseHTTPRequestHandler):
 
             try:
                 if raw_payload.get("stream"):
-                    include_thinking = bool((raw_payload.get("thinking") or {}).get("enabled"))
+                    include_thinking = anthropic_thinking_enabled(raw_payload.get("thinking"))
                     if self._should_use_buffered_anthropic_sse():
                         with session_coordinator.hold(session_key):
                             response = self._fetch_final_response(payload, session_key)
-                        message_payload = response_to_anthropic_message(response, requested_model)
-                        self._write_anthropic_message_sse(message_payload)
+                        message_payload = response_to_anthropic_message(
+                            response,
+                            requested_model,
+                            requested_speed=requested_speed,
+                        )
+                        self._write_anthropic_message_sse(
+                            message_payload,
+                            connector_text_mode=connector_text_mode,
+                        )
                     else:
                         try:
                             with session_coordinator.hold(session_key):
@@ -5436,18 +5936,39 @@ class Handler(BaseHTTPRequestHandler):
                                     session_key,
                                     model=requested_model,
                                     include_thinking=include_thinking,
+                                    connector_text_mode=connector_text_mode,
+                                    requested_speed=requested_speed,
                                 )
                         except RuntimeError:
                             with session_coordinator.hold(session_key):
                                 response = self._fetch_final_response(payload, session_key)
-                            message_payload = response_to_anthropic_message(response, requested_model)
-                            self._write_anthropic_message_sse(message_payload)
+                            message_payload = response_to_anthropic_message(
+                                response,
+                                requested_model,
+                                requested_speed=requested_speed,
+                            )
+                            self._write_anthropic_message_sse(
+                                message_payload,
+                                connector_text_mode=connector_text_mode,
+                            )
                         else:
-                            message_payload = response_to_anthropic_message(response, requested_model) if response else None
+                            message_payload = (
+                                response_to_anthropic_message(
+                                    response,
+                                    requested_model,
+                                    requested_speed=requested_speed,
+                                )
+                                if response
+                                else None
+                            )
                 else:
                     with session_coordinator.hold(session_key):
                         response = self._fetch_final_response(payload, session_key)
-                    message_payload = response_to_anthropic_message(response, requested_model)
+                    message_payload = response_to_anthropic_message(
+                        response,
+                        requested_model,
+                        requested_speed=requested_speed,
+                    )
                     self._write_json(200, message_payload, extra_headers=self._response_metric_headers(message_payload.get("usage") or {}))
                 self._record_completed_transcript(
                     path,
@@ -5455,7 +5976,14 @@ class Handler(BaseHTTPRequestHandler):
                     requested_model,
                     payload,
                     raw_payload,
-                    transcript_response_section_for_anthropic(message_payload or response_to_anthropic_message(response, requested_model)),
+                    transcript_response_section_for_anthropic(
+                        message_payload
+                        or response_to_anthropic_message(
+                            response,
+                            requested_model,
+                            requested_speed=requested_speed,
+                        )
+                    ),
                 )
             except ProxyError as exc:
                 self._record_failed_transcript(
@@ -5487,6 +6015,8 @@ class Handler(BaseHTTPRequestHandler):
                 )
                 self._forward_anthropic_http_error(exc)
             except Exception as exc:
+                if is_client_disconnect_error(exc):
+                    return
                 self._record_failed_transcript(
                     path,
                     session_context,
@@ -5610,6 +6140,8 @@ class Handler(BaseHTTPRequestHandler):
                 )
                 self._forward_http_error(exc)
             except Exception as exc:
+                if is_client_disconnect_error(exc):
+                    return
                 self._record_failed_transcript(
                     path,
                     session_context,
@@ -5733,6 +6265,8 @@ class Handler(BaseHTTPRequestHandler):
             )
             self._forward_http_error(exc)
         except Exception as exc:
+            if is_client_disconnect_error(exc):
+                return
             self._record_failed_transcript(
                 path,
                 session_context,
@@ -5926,8 +6460,8 @@ class Handler(BaseHTTPRequestHandler):
             record_account_usage(self._current_account_name(), response)
         return response
 
-    def _write_anthropic_message_sse(self, message_payload):
-        body = anthropic_sse_body_from_message(message_payload)
+    def _write_anthropic_message_sse(self, message_payload, *, connector_text_mode=False):
+        body = anthropic_sse_body_from_message(message_payload, connector_text_mode=connector_text_mode)
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream; charset=utf-8")
         self.send_header("Cache-Control", "no-cache")
@@ -5939,14 +6473,29 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
         self.wfile.flush()
 
-    def _stream_anthropic_message_from_upstream(self, payload, session_key, *, model, include_thinking=False):
+    def _stream_anthropic_message_from_upstream(
+        self,
+        payload,
+        session_key,
+        *,
+        model,
+        include_thinking=False,
+        connector_text_mode=False,
+        requested_speed=None,
+    ):
         with self._upstream(payload, session_key) as upstream:
             reader = RecordingUpstreamReader(upstream)
             self._send_sse_headers(
                 getattr(upstream, "status", 200),
                 extra_headers=self._response_metric_headers(),
             )
-            for chunk in iter_anthropic_message_sse(reader, model, include_thinking=include_thinking):
+            for chunk in iter_anthropic_message_sse(
+                reader,
+                model,
+                include_thinking=include_thinking,
+                connector_text_mode=connector_text_mode,
+                requested_speed=requested_speed,
+            ):
                 self.wfile.write(chunk)
                 self.wfile.flush()
             response = extract_final_response(reader.body_text())

@@ -164,12 +164,67 @@ Current Anthropic compatibility mappings:
 - `claude-opus-4-6` -> local `gpt-5.4-1m` -> upstream `gpt-5.4`
 - `claude-sonnet-4-6` -> local `gpt-5.4` -> upstream `gpt-5.4`
 - `claude-haiku-4-5` -> local `gpt-5.3-codex` -> upstream `gpt-5.3-codex`
+- You can also send `gpt-5.4`, `gpt-5.4-1m`, or `gpt-5.3-codex` directly, which is useful when switching GPT model types explicitly from Claude Code
 
 Special note for 1M on the Anthropic-compatible layer:
 
 - `claude-opus-4-6` now uses the `gpt-5.4-1m` budget, so it is the 1M-context variant by default.
 - If you want the Anthropic-compatible endpoint to stay on the normal window, use `claude-sonnet-4-6`.
 - Choosing `claude-opus-4-6` can also mean higher token usage, potentially higher cost, and slower request latency.
+
+The Anthropic-compatible layer also currently supports:
+
+- `thinking` with `budget_tokens` and `type: "adaptive"`
+- `output_config.format` and `output_config.effort`
+- `speed: "fast"`. When the request includes `anthropic-beta: fast-mode-*`, the proxy prefers the non-1M route and automatically uses `low` effort if no explicit effort/thinking setting was provided; the response `usage` also echoes `speed: "fast"`
+- user-message `image` content blocks
+- user-message `document` content blocks, translated into Responses `input_file`
+- `POST /v1/messages/count_tokens` with tool, image, and structured-output schema overhead
+- buffered SSE compatibility for Bearer-auth or Claude-Code-like clients
+- empty `signature_delta` compatibility frames for streamed thinking blocks
+
+When used from `free-code` / Claude Code, the compatibility layer now also supports these interaction patterns:
+
+- passing `gpt-5.4`, `gpt-5.4-1m`, or `gpt-5.3-codex` directly as the Anthropic `model`, which makes explicit GPT-family switching from `/model` practical
+- a family-aware `/model` picker. If the current session is already on a GPT model, the picker shows GPT choices; if the session is on a Claude model, it keeps showing Claude choices
+- a dedicated `/effort` picker. On `gpt-5.4` / `gpt-5.4-1m`, the available levels are `low`, `medium`, `high`, `extra-high`, and `auto`
+- normalization of Anthropic-side `extra-high` into the upstream-compatible `xhigh`
+- `/fast` through the Anthropic `speed: "fast"` path, gated by `anthropic-beta: fast-mode-*`; the proxy prefers the non-1M route and echoes `usage.speed = "fast"` back to the client
+
+The Anthropic-compatible layer currently accepts but ignores:
+
+- `metadata`
+
+The Anthropic-compatible layer now validates and uses `anthropic-beta` when needed:
+
+- `output_config.format` requires `structured-outputs-*`
+- `output_config.effort` requires `effort-*`
+- `output_config.task_budget` requires `task-budgets-*`
+- `context_management` requires `context-management-*`
+- `speed: "fast"` requires `fast-mode-*`
+- streaming `connector_text` compatibility requires `summarize-connector-text-*`
+- `tool_reference` plus tool-schema `defer_loading` / `eager_input_streaming` require `advanced-tool-use-*` or `tool-search-tool-*`
+
+When the matching beta is present:
+
+- `context_management` and `speed` are still consumed and ignored by the compatibility layer instead of being forwarded upstream
+- streamed text blocks switch to `connector_text` / `connector_text_delta` event shapes and include an empty `signature_delta` before close
+
+Current handling for `tool_reference`:
+
+- tool names are preserved and flattened into compatibility text inside `tool_result`
+- this is not full Anthropic server-side expansion semantics, but it keeps `free-code`-style discovered-tool history usable
+
+Current history-compatibility downgrades:
+
+- assistant-history `server_tool_use` blocks are flattened into text with tool name and summarized input
+- `connector_text` is treated as ordinary text
+- `image` / `document` items nested inside `tool_result` content are downgraded into placeholders so older sessions can resume without hard failures
+
+The Anthropic-compatible layer still rejects explicitly:
+
+- document shapes that do not map cleanly to `input_file`, such as `document.source.type = "content"`
+- deeper Anthropic-only server tool semantics that still do not map safely
 
 ```bash
 curl http://127.0.0.1:18100/v1/messages \

@@ -109,6 +109,283 @@ def make_test_jwt(payload):
     return f"{header}.{body}."
 
 
+def clone_json_fixture(value):
+    return json.loads(json.dumps(value))
+
+
+def count_anthropic_tokens(base_url, payload, extra_headers=None):
+    headers = {"Content-Type": "application/json", "anthropic-version": "2023-06-01"}
+    if extra_headers:
+        headers.update(extra_headers)
+    req = urllib.request.Request(
+        f"{base_url}/v1/messages/count_tokens",
+        data=json.dumps(payload).encode("utf-8"),
+        headers=headers,
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        response_payload = json.load(resp)
+    return response_payload["input_tokens"]
+
+
+STRUCTURED_OUTPUTS_BETA_HEADER = "structured-outputs-2025-12-15"
+EFFORT_BETA_HEADER = "effort-2025-11-24"
+TASK_BUDGETS_BETA_HEADER = "task-budgets-2026-03-13"
+CONTEXT_MANAGEMENT_BETA_HEADER = "context-management-2025-06-27"
+FAST_MODE_BETA_HEADER = "fast-mode-2026-02-01"
+TOOL_SEARCH_BETA_HEADER = "advanced-tool-use-2025-11-20"
+
+
+ANTHROPIC_SIMPLE_TEXT_CHAT_FIXTURE = {
+    "model": "claude-sonnet-4-6",
+    "max_tokens": 256,
+    "system": [{"type": "text", "text": "You are a careful coding assistant."}],
+    "messages": [
+        {
+            "role": "user",
+            "content": [{"type": "text", "text": "Summarize the current compatibility gaps."}],
+        }
+    ],
+}
+
+ANTHROPIC_TOOL_USE_AND_RESULT_FIXTURE = {
+    "model": "claude-sonnet-4-6",
+    "max_tokens": 256,
+    "messages": [
+        {
+            "role": "assistant",
+            "content": [
+                {"type": "text", "text": "I will inspect the cache state."},
+                {"type": "tool_use", "id": "toolu_1", "name": "lookup", "input": {"q": "cache"}},
+            ],
+        },
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_1",
+                    "content": [{"type": "text", "text": "cache hit"}],
+                }
+            ],
+        },
+    ],
+    "tools": [
+        {
+            "name": "lookup",
+            "description": "Read cached state",
+            "input_schema": {"type": "object", "properties": {"q": {"type": "string"}}},
+        }
+    ],
+    "tool_choice": {"type": "tool", "name": "lookup"},
+}
+
+ANTHROPIC_ADAPTIVE_THINKING_FIXTURE = {
+    "model": "claude-sonnet-4-6",
+    "max_tokens": 256,
+    "thinking": {"type": "adaptive"},
+    "messages": [
+        {
+            "role": "user",
+            "content": [{"type": "text", "text": "Think carefully, then answer in one sentence."}],
+        }
+    ],
+}
+
+ANTHROPIC_OUTPUT_CONFIG_FORMAT_FIXTURE = {
+    "model": "claude-sonnet-4-6",
+    "max_tokens": 256,
+    "messages": [
+        {
+            "role": "user",
+            "content": [{"type": "text", "text": "Return a JSON object with a title."}],
+        }
+    ],
+    "output_config": {
+        "format": {
+            "type": "json_schema",
+            "schema": {
+                "type": "object",
+                "properties": {"title": {"type": "string"}},
+                "required": ["title"],
+                "additionalProperties": False,
+            },
+        }
+    },
+}
+
+ANTHROPIC_OUTPUT_CONFIG_EFFORT_FIXTURE = {
+    "model": "claude-sonnet-4-6",
+    "max_tokens": 256,
+    "messages": [
+        {
+            "role": "user",
+            "content": [{"type": "text", "text": "Use more reasoning before replying."}],
+        }
+    ],
+    "output_config": {"effort": "high"},
+}
+
+ANTHROPIC_IMAGE_INPUT_FIXTURE = {
+    "model": "claude-sonnet-4-6",
+    "max_tokens": 256,
+    "messages": [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "Describe this screenshot."},
+                {
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": "image/png",
+                        "data": base64.b64encode(b"png-bytes").decode("ascii"),
+                    },
+                },
+            ],
+        }
+    ],
+}
+
+ANTHROPIC_IGNORED_COMPATIBILITY_FIELDS_FIXTURE = {
+    "model": "claude-sonnet-4-6",
+    "max_tokens": 256,
+    "messages": [
+        {
+            "role": "user",
+            "content": [{"type": "text", "text": "Ignore compatibility-only wrappers."}],
+        }
+    ],
+    "metadata": {"user_id": "user-1"},
+    "context_management": {"clear_function_results": False},
+    "speed": "fast",
+}
+
+ANTHROPIC_UNSUPPORTED_DOCUMENT_FIXTURE = {
+    "model": "claude-sonnet-4-6",
+    "max_tokens": 256,
+    "messages": [
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "document",
+                    "source": {
+                        "type": "content",
+                        "content": [{"type": "text", "text": "inline content blocks are not supported yet"}],
+                    },
+                }
+            ],
+        }
+    ],
+}
+
+ANTHROPIC_DOCUMENT_INPUT_FIXTURE = {
+    "model": "claude-sonnet-4-6",
+    "max_tokens": 256,
+    "messages": [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "Summarize this PDF."},
+                {
+                    "type": "document",
+                    "title": "spec.pdf",
+                    "source": {
+                        "type": "base64",
+                        "media_type": "application/pdf",
+                        "data": base64.b64encode(b"%PDF-1.7").decode("ascii"),
+                    },
+                },
+            ],
+        }
+    ],
+}
+
+ANTHROPIC_TOOL_REFERENCE_FIXTURE = {
+    "model": "claude-sonnet-4-6",
+    "max_tokens": 256,
+    "messages": [
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_search",
+                    "content": [
+                        {"type": "tool_reference", "tool_name": "Read"},
+                        {"type": "tool_reference", "tool_name": "Edit"},
+                    ],
+                }
+            ],
+        }
+    ],
+}
+
+ANTHROPIC_SERVER_TOOL_HISTORY_FIXTURE = {
+    "model": "claude-sonnet-4-6",
+    "max_tokens": 256,
+    "messages": [
+        {
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "server_tool_use",
+                    "id": "srvu_1",
+                    "name": "web_search",
+                    "input": {"query": "codex2gpt anthropic compatibility"},
+                },
+                {
+                    "type": "connector_text",
+                    "connector_text": "Searching upstream docs...",
+                },
+                {"type": "text", "text": "Here is what I found."},
+            ],
+        },
+        {
+            "role": "user",
+            "content": "Continue.",
+        },
+    ],
+}
+
+ANTHROPIC_TOOL_RESULT_MEDIA_FIXTURE = {
+    "model": "claude-sonnet-4-6",
+    "max_tokens": 256,
+    "messages": [
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_media",
+                    "content": [
+                        {"type": "text", "text": "Generated assets."},
+                        {
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": "image/png",
+                                "data": base64.b64encode(b"png").decode("ascii"),
+                            },
+                        },
+                        {
+                            "type": "document",
+                            "title": "report.pdf",
+                            "source": {
+                                "type": "base64",
+                                "media_type": "application/pdf",
+                                "data": base64.b64encode(b"%PDF-1.7").decode("ascii"),
+                            },
+                        },
+                    ],
+                }
+            ],
+        }
+    ],
+}
+
+
 @contextmanager
 def run_test_server(module, fetch_response=None, upstream_body=None, upstream_status=200, upstream_exception=None, account_name="oauth-test"):
     original_fetch = module.Handler._fetch_final_response
@@ -585,6 +862,318 @@ class Codex2GptCompatibilityTests(unittest.TestCase):
         finally:
             restore_auth_dir(tempdir, original_auth_dir)
 
+    def test_build_responses_payload_from_anthropic_ignores_compatibility_only_fields(self):
+        app, tempdir, original_auth_dir = load_app_module()
+        try:
+            requested_model, payload = app.build_responses_payload_from_anthropic(
+                clone_json_fixture(ANTHROPIC_IGNORED_COMPATIBILITY_FIELDS_FIXTURE)
+            )
+            self.assertEqual(requested_model, "claude-sonnet-4-6")
+            self.assertNotIn("metadata", payload)
+            self.assertNotIn("context_management", payload)
+            self.assertNotIn("speed", payload)
+        finally:
+            restore_auth_dir(tempdir, original_auth_dir)
+
+    def test_build_responses_payload_from_anthropic_requires_structured_outputs_beta_when_enforced(self):
+        app, tempdir, original_auth_dir = load_app_module()
+        try:
+            with self.assertRaises(app.ProxyError) as ctx:
+                app.build_responses_payload_from_anthropic(
+                    clone_json_fixture(ANTHROPIC_OUTPUT_CONFIG_FORMAT_FIXTURE),
+                    enabled_betas=[],
+                )
+            self.assertEqual(ctx.exception.status, 400)
+            self.assertIn("structured-outputs-*", ctx.exception.message)
+
+            requested_model, payload = app.build_responses_payload_from_anthropic(
+                clone_json_fixture(ANTHROPIC_OUTPUT_CONFIG_FORMAT_FIXTURE),
+                enabled_betas=[STRUCTURED_OUTPUTS_BETA_HEADER],
+            )
+            self.assertEqual(requested_model, "claude-sonnet-4-6")
+            self.assertEqual(payload["text"]["format"]["type"], "json_schema")
+        finally:
+            restore_auth_dir(tempdir, original_auth_dir)
+
+    def test_build_responses_payload_from_anthropic_requires_effort_beta_when_enforced(self):
+        app, tempdir, original_auth_dir = load_app_module()
+        try:
+            with self.assertRaises(app.ProxyError) as ctx:
+                app.build_responses_payload_from_anthropic(
+                    clone_json_fixture(ANTHROPIC_OUTPUT_CONFIG_EFFORT_FIXTURE),
+                    enabled_betas=[],
+                )
+            self.assertEqual(ctx.exception.status, 400)
+            self.assertIn("effort-*", ctx.exception.message)
+
+            requested_model, payload = app.build_responses_payload_from_anthropic(
+                clone_json_fixture(ANTHROPIC_OUTPUT_CONFIG_EFFORT_FIXTURE),
+                enabled_betas=[EFFORT_BETA_HEADER],
+            )
+            self.assertEqual(requested_model, "claude-sonnet-4-6")
+            self.assertEqual(payload["reasoning"]["effort"], "high")
+        finally:
+            restore_auth_dir(tempdir, original_auth_dir)
+
+    def test_build_responses_payload_from_anthropic_requires_context_management_beta_when_enforced(self):
+        app, tempdir, original_auth_dir = load_app_module()
+        try:
+            fixture = clone_json_fixture(ANTHROPIC_IGNORED_COMPATIBILITY_FIELDS_FIXTURE)
+            fixture["speed"] = "standard"
+            with self.assertRaises(app.ProxyError) as ctx:
+                app.build_responses_payload_from_anthropic(fixture, enabled_betas=[])
+            self.assertEqual(ctx.exception.status, 400)
+            self.assertIn("context-management-*", ctx.exception.message)
+
+            requested_model, payload = app.build_responses_payload_from_anthropic(
+                fixture,
+                enabled_betas=[CONTEXT_MANAGEMENT_BETA_HEADER],
+            )
+            self.assertEqual(requested_model, "claude-sonnet-4-6")
+            self.assertNotIn("context_management", payload)
+        finally:
+            restore_auth_dir(tempdir, original_auth_dir)
+
+    def test_build_responses_payload_from_anthropic_requires_fast_mode_beta_when_enforced(self):
+        app, tempdir, original_auth_dir = load_app_module()
+        try:
+            fixture = clone_json_fixture(ANTHROPIC_SIMPLE_TEXT_CHAT_FIXTURE)
+            fixture["speed"] = "fast"
+            with self.assertRaises(app.ProxyError) as ctx:
+                app.build_responses_payload_from_anthropic(fixture, enabled_betas=[])
+            self.assertEqual(ctx.exception.status, 400)
+            self.assertIn("fast-mode-*", ctx.exception.message)
+
+            requested_model, payload = app.build_responses_payload_from_anthropic(
+                fixture,
+                enabled_betas=[FAST_MODE_BETA_HEADER],
+            )
+            self.assertEqual(requested_model, "claude-sonnet-4-6")
+            self.assertNotIn("speed", payload)
+        finally:
+            restore_auth_dir(tempdir, original_auth_dir)
+
+    def test_build_responses_payload_from_anthropic_fast_mode_prefers_non_1m_model_and_minimal_effort(self):
+        app, tempdir, original_auth_dir = load_app_module()
+        try:
+            fixture = clone_json_fixture(ANTHROPIC_SIMPLE_TEXT_CHAT_FIXTURE)
+            fixture["model"] = "claude-opus-4-6"
+            fixture["speed"] = "fast"
+            requested_model, payload = app.build_responses_payload_from_anthropic(
+                fixture,
+                enabled_betas=[FAST_MODE_BETA_HEADER],
+            )
+            self.assertEqual(requested_model, "claude-opus-4-6")
+            self.assertEqual(payload["model"], "gpt-5.4")
+            self.assertEqual(payload["reasoning"]["effort"], "low")
+        finally:
+            restore_auth_dir(tempdir, original_auth_dir)
+
+    def test_build_responses_payload_from_anthropic_fast_mode_preserves_explicit_effort(self):
+        app, tempdir, original_auth_dir = load_app_module()
+        try:
+            fixture = clone_json_fixture(ANTHROPIC_OUTPUT_CONFIG_EFFORT_FIXTURE)
+            fixture["model"] = "claude-opus-4-6"
+            fixture["speed"] = "fast"
+            requested_model, payload = app.build_responses_payload_from_anthropic(
+                fixture,
+                enabled_betas=[FAST_MODE_BETA_HEADER, EFFORT_BETA_HEADER],
+            )
+            self.assertEqual(requested_model, "claude-opus-4-6")
+            self.assertEqual(payload["model"], "gpt-5.4")
+            self.assertEqual(payload["reasoning"]["effort"], "high")
+        finally:
+            restore_auth_dir(tempdir, original_auth_dir)
+
+    def test_build_responses_payload_from_anthropic_requires_tool_search_beta_for_extras_when_enforced(self):
+        app, tempdir, original_auth_dir = load_app_module()
+        try:
+            fixture = clone_json_fixture(ANTHROPIC_TOOL_USE_AND_RESULT_FIXTURE)
+            fixture["tools"][0]["defer_loading"] = True
+            fixture["tools"][0]["eager_input_streaming"] = True
+            with self.assertRaises(app.ProxyError) as ctx:
+                app.build_responses_payload_from_anthropic(fixture, enabled_betas=[])
+            self.assertEqual(ctx.exception.status, 400)
+            self.assertIn("advanced-tool-use-* or tool-search-tool-*", ctx.exception.message)
+
+            requested_model, payload = app.build_responses_payload_from_anthropic(
+                fixture,
+                enabled_betas=[TOOL_SEARCH_BETA_HEADER],
+            )
+            self.assertEqual(requested_model, "claude-sonnet-4-6")
+            self.assertEqual(payload["tools"][0]["name"], "lookup")
+        finally:
+            restore_auth_dir(tempdir, original_auth_dir)
+
+    def test_build_responses_payload_from_anthropic_requires_task_budget_beta_when_enforced(self):
+        app, tempdir, original_auth_dir = load_app_module()
+        try:
+            fixture = clone_json_fixture(ANTHROPIC_SIMPLE_TEXT_CHAT_FIXTURE)
+            fixture["output_config"] = {"task_budget": {"type": "tokens", "total": 2048, "remaining": 1024}}
+            with self.assertRaises(app.ProxyError) as ctx:
+                app.build_responses_payload_from_anthropic(fixture, enabled_betas=[])
+            self.assertEqual(ctx.exception.status, 400)
+            self.assertIn("task-budgets-*", ctx.exception.message)
+
+            requested_model, payload = app.build_responses_payload_from_anthropic(
+                fixture,
+                enabled_betas=[TASK_BUDGETS_BETA_HEADER],
+            )
+            self.assertEqual(requested_model, "claude-sonnet-4-6")
+            self.assertNotIn("output_config", payload)
+        finally:
+            restore_auth_dir(tempdir, original_auth_dir)
+
+    def test_build_responses_payload_from_anthropic_maps_output_config_effort_to_reasoning(self):
+        app, tempdir, original_auth_dir = load_app_module()
+        try:
+            requested_model, payload = app.build_responses_payload_from_anthropic(
+                clone_json_fixture(ANTHROPIC_OUTPUT_CONFIG_EFFORT_FIXTURE)
+            )
+            self.assertEqual(requested_model, "claude-sonnet-4-6")
+            self.assertEqual(payload["reasoning"]["effort"], "high")
+            self.assertNotIn("output_config", payload)
+        finally:
+            restore_auth_dir(tempdir, original_auth_dir)
+
+    def test_build_responses_payload_from_anthropic_maps_output_config_format_to_structured_output(self):
+        app, tempdir, original_auth_dir = load_app_module()
+        try:
+            requested_model, payload = app.build_responses_payload_from_anthropic(
+                clone_json_fixture(ANTHROPIC_OUTPUT_CONFIG_FORMAT_FIXTURE)
+            )
+            self.assertEqual(requested_model, "claude-sonnet-4-6")
+            self.assertEqual(payload["text"]["format"]["type"], "json_schema")
+            self.assertEqual(payload["text"]["format"]["name"], "structured_output")
+            self.assertEqual(payload["text"]["format"]["schema"]["properties"]["title"]["type"], "string")
+            self.assertFalse(payload["text"]["format"]["schema"]["additionalProperties"])
+            self.assertNotIn("output_config", payload)
+        finally:
+            restore_auth_dir(tempdir, original_auth_dir)
+
+    def test_build_responses_payload_from_anthropic_supports_adaptive_thinking(self):
+        app, tempdir, original_auth_dir = load_app_module()
+        try:
+            requested_model, payload = app.build_responses_payload_from_anthropic(
+                clone_json_fixture(ANTHROPIC_ADAPTIVE_THINKING_FIXTURE)
+            )
+            self.assertEqual(requested_model, "claude-sonnet-4-6")
+            self.assertEqual(payload["reasoning"]["effort"], app.DEFAULT_REASONING_EFFORT)
+        finally:
+            restore_auth_dir(tempdir, original_auth_dir)
+
+    def test_build_responses_payload_from_anthropic_supports_image_input_blocks(self):
+        app, tempdir, original_auth_dir = load_app_module()
+        try:
+            requested_model, payload = app.build_responses_payload_from_anthropic(
+                clone_json_fixture(ANTHROPIC_IMAGE_INPUT_FIXTURE)
+            )
+            self.assertEqual(requested_model, "claude-sonnet-4-6")
+            self.assertEqual(payload["input"][0]["role"], "user")
+            self.assertEqual(payload["input"][0]["content"][0]["type"], "input_text")
+            self.assertEqual(payload["input"][0]["content"][1]["type"], "input_image")
+            self.assertTrue(payload["input"][0]["content"][1]["image_url"].startswith("data:image/png;base64,"))
+        finally:
+            restore_auth_dir(tempdir, original_auth_dir)
+
+    def test_build_responses_payload_from_anthropic_supports_document_input_blocks(self):
+        app, tempdir, original_auth_dir = load_app_module()
+        try:
+            requested_model, payload = app.build_responses_payload_from_anthropic(
+                clone_json_fixture(ANTHROPIC_DOCUMENT_INPUT_FIXTURE)
+            )
+            self.assertEqual(requested_model, "claude-sonnet-4-6")
+            self.assertEqual(payload["input"][0]["role"], "user")
+            self.assertEqual(payload["input"][0]["content"][0]["type"], "input_text")
+            self.assertEqual(payload["input"][0]["content"][1]["type"], "input_file")
+            self.assertEqual(payload["input"][0]["content"][1]["filename"], "spec.pdf")
+            self.assertTrue(payload["input"][0]["content"][1]["file_data"].startswith("data:application/pdf;base64,"))
+        finally:
+            restore_auth_dir(tempdir, original_auth_dir)
+
+    def test_build_responses_payload_from_anthropic_rejects_document_blocks_explicitly(self):
+        app, tempdir, original_auth_dir = load_app_module()
+        try:
+            with self.assertRaises(app.ProxyError) as ctx:
+                app.build_responses_payload_from_anthropic(clone_json_fixture(ANTHROPIC_UNSUPPORTED_DOCUMENT_FIXTURE))
+            self.assertEqual(ctx.exception.status, 400)
+            self.assertEqual(ctx.exception.error_type, "invalid_request_error")
+            self.assertIn("document", ctx.exception.message)
+        finally:
+            restore_auth_dir(tempdir, original_auth_dir)
+
+    def test_build_responses_payload_from_anthropic_flattens_tool_reference_blocks(self):
+        app, tempdir, original_auth_dir = load_app_module()
+        try:
+            requested_model, payload = app.build_responses_payload_from_anthropic(
+                clone_json_fixture(ANTHROPIC_TOOL_REFERENCE_FIXTURE)
+            )
+            self.assertEqual(requested_model, "claude-sonnet-4-6")
+            self.assertEqual(payload["input"][0]["type"], "function_call_output")
+            self.assertIn("Read", payload["input"][0]["output"])
+            self.assertIn("Edit", payload["input"][0]["output"])
+        finally:
+            restore_auth_dir(tempdir, original_auth_dir)
+
+    def test_build_responses_payload_from_anthropic_requires_tool_search_beta_for_tool_reference_when_enforced(self):
+        app, tempdir, original_auth_dir = load_app_module()
+        try:
+            with self.assertRaises(app.ProxyError) as ctx:
+                app.build_responses_payload_from_anthropic(
+                    clone_json_fixture(ANTHROPIC_TOOL_REFERENCE_FIXTURE),
+                    enabled_betas=[],
+                )
+            self.assertEqual(ctx.exception.status, 400)
+            self.assertIn("advanced-tool-use-* or tool-search-tool-*", ctx.exception.message)
+        finally:
+            restore_auth_dir(tempdir, original_auth_dir)
+
+    def test_build_responses_payload_from_anthropic_flattens_server_tool_history_blocks(self):
+        app, tempdir, original_auth_dir = load_app_module()
+        try:
+            requested_model, payload = app.build_responses_payload_from_anthropic(
+                clone_json_fixture(ANTHROPIC_SERVER_TOOL_HISTORY_FIXTURE)
+            )
+            self.assertEqual(requested_model, "claude-sonnet-4-6")
+            self.assertEqual(payload["input"][0]["role"], "assistant")
+            assistant_text = "\n".join(part["text"] for part in payload["input"][0]["content"])
+            self.assertIn("Server tool use", assistant_text)
+            self.assertIn("web_search", assistant_text)
+            self.assertIn("Searching upstream docs...", assistant_text)
+            self.assertIn("Here is what I found.", assistant_text)
+        finally:
+            restore_auth_dir(tempdir, original_auth_dir)
+
+    def test_build_responses_payload_from_anthropic_flattens_tool_result_media_blocks(self):
+        app, tempdir, original_auth_dir = load_app_module()
+        try:
+            requested_model, payload = app.build_responses_payload_from_anthropic(
+                clone_json_fixture(ANTHROPIC_TOOL_RESULT_MEDIA_FIXTURE)
+            )
+            self.assertEqual(requested_model, "claude-sonnet-4-6")
+            self.assertEqual(payload["input"][0]["type"], "function_call_output")
+            self.assertIn("Generated assets.", payload["input"][0]["output"])
+            self.assertIn("Image result", payload["input"][0]["output"])
+            self.assertIn("Document result", payload["input"][0]["output"])
+        finally:
+            restore_auth_dir(tempdir, original_auth_dir)
+
+    def test_build_responses_payload_from_anthropic_ignores_extra_tool_fields(self):
+        app, tempdir, original_auth_dir = load_app_module()
+        try:
+            fixture = clone_json_fixture(ANTHROPIC_TOOL_USE_AND_RESULT_FIXTURE)
+            fixture["tools"][0]["cache_control"] = {"type": "ephemeral"}
+            fixture["tools"][0]["defer_loading"] = True
+            fixture["tools"][0]["eager_input_streaming"] = True
+            requested_model, payload = app.build_responses_payload_from_anthropic(fixture)
+            self.assertEqual(requested_model, "claude-sonnet-4-6")
+            self.assertEqual(payload["tools"][0]["name"], "lookup")
+            self.assertNotIn("cache_control", payload["tools"][0])
+            self.assertNotIn("defer_loading", payload["tools"][0])
+            self.assertNotIn("eager_input_streaming", payload["tools"][0])
+        finally:
+            restore_auth_dir(tempdir, original_auth_dir)
+
     def test_anthropic_budget_model_uses_opus_1m_alias(self):
         app, tempdir, original_auth_dir = load_app_module(
             {
@@ -724,6 +1313,29 @@ class Codex2GptCompatibilityTests(unittest.TestCase):
         finally:
             restore_auth_dir(tempdir, original_auth_dir)
 
+    def test_response_to_anthropic_message_includes_fast_speed_when_requested(self):
+        app, tempdir, original_auth_dir = load_app_module()
+        try:
+            message = app.response_to_anthropic_message(
+                {
+                    "id": "resp_1",
+                    "status": "completed",
+                    "output": [
+                        {
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [{"type": "output_text", "text": "OK"}],
+                        }
+                    ],
+                    "usage": {"input_tokens": 12, "output_tokens": 4},
+                },
+                "claude-opus-4-6",
+                requested_speed="fast",
+            )
+            self.assertEqual(message["usage"]["speed"], "fast")
+        finally:
+            restore_auth_dir(tempdir, original_auth_dir)
+
     def test_anthropic_sse_body_has_named_events(self):
         app, tempdir, original_auth_dir = load_app_module()
         try:
@@ -752,25 +1364,91 @@ class Codex2GptCompatibilityTests(unittest.TestCase):
         finally:
             restore_auth_dir(tempdir, original_auth_dir)
 
+    def test_anthropic_sse_body_includes_fast_speed_usage(self):
+        app, tempdir, original_auth_dir = load_app_module()
+        try:
+            body = app.anthropic_sse_body_from_message(
+                {
+                    "id": "msg_fast",
+                    "type": "message",
+                    "role": "assistant",
+                    "model": "claude-opus-4-6",
+                    "content": [{"type": "text", "text": "OK"}],
+                    "stop_reason": "end_turn",
+                    "stop_sequence": None,
+                    "usage": {"input_tokens": 11, "output_tokens": 7, "speed": "fast"},
+                }
+            ).decode("utf-8")
+            self.assertIn('"speed": "fast"', body)
+        finally:
+            restore_auth_dir(tempdir, original_auth_dir)
+
     def test_messages_count_tokens_endpoint_estimates_input_tokens(self):
         app, tempdir, original_auth_dir = load_app_module()
         try:
             with run_test_server(app) as base_url:
-                req = urllib.request.Request(
-                    f"{base_url}/v1/messages/count_tokens",
-                    data=json.dumps(
-                        {
-                            "model": "claude-opus-4-6",
-                            "max_tokens": 256,
-                            "messages": [{"role": "user", "content": "hello"}],
-                        }
-                    ).encode("utf-8"),
-                    headers={"Content-Type": "application/json", "anthropic-version": "2023-06-01"},
-                    method="POST",
+                input_tokens = count_anthropic_tokens(
+                    base_url,
+                    {
+                        "model": "claude-opus-4-6",
+                        "max_tokens": 256,
+                        "messages": [{"role": "user", "content": "hello"}],
+                    },
                 )
-                with urllib.request.urlopen(req, timeout=30) as resp:
-                    payload = json.load(resp)
-            self.assertGreater(payload["input_tokens"], 0)
+            self.assertGreater(input_tokens, 0)
+        finally:
+            restore_auth_dir(tempdir, original_auth_dir)
+
+    def test_messages_count_tokens_endpoint_counts_tool_schema_overhead(self):
+        app, tempdir, original_auth_dir = load_app_module()
+        try:
+            with run_test_server(app) as base_url:
+                base_payload = clone_json_fixture(ANTHROPIC_SIMPLE_TEXT_CHAT_FIXTURE)
+                tools_payload = clone_json_fixture(ANTHROPIC_SIMPLE_TEXT_CHAT_FIXTURE)
+                tools_payload["tools"] = clone_json_fixture(ANTHROPIC_TOOL_USE_AND_RESULT_FIXTURE["tools"])
+                base_tokens = count_anthropic_tokens(base_url, base_payload)
+                tool_tokens = count_anthropic_tokens(base_url, tools_payload)
+            self.assertGreater(tool_tokens, base_tokens)
+        finally:
+            restore_auth_dir(tempdir, original_auth_dir)
+
+    def test_messages_count_tokens_endpoint_counts_image_input(self):
+        app, tempdir, original_auth_dir = load_app_module()
+        try:
+            with run_test_server(app) as base_url:
+                base_payload = clone_json_fixture(ANTHROPIC_SIMPLE_TEXT_CHAT_FIXTURE)
+                base_payload["messages"][0]["content"][0]["text"] = "Describe this screenshot."
+                base_tokens = count_anthropic_tokens(base_url, base_payload)
+                image_tokens = count_anthropic_tokens(base_url, clone_json_fixture(ANTHROPIC_IMAGE_INPUT_FIXTURE))
+            self.assertGreater(image_tokens, base_tokens)
+        finally:
+            restore_auth_dir(tempdir, original_auth_dir)
+
+    def test_messages_count_tokens_endpoint_counts_document_input(self):
+        app, tempdir, original_auth_dir = load_app_module()
+        try:
+            with run_test_server(app) as base_url:
+                base_payload = clone_json_fixture(ANTHROPIC_SIMPLE_TEXT_CHAT_FIXTURE)
+                base_payload["messages"][0]["content"][0]["text"] = "Summarize this PDF."
+                base_tokens = count_anthropic_tokens(base_url, base_payload)
+                document_tokens = count_anthropic_tokens(base_url, clone_json_fixture(ANTHROPIC_DOCUMENT_INPUT_FIXTURE))
+            self.assertGreater(document_tokens, base_tokens)
+        finally:
+            restore_auth_dir(tempdir, original_auth_dir)
+
+    def test_messages_count_tokens_endpoint_counts_structured_output_schema(self):
+        app, tempdir, original_auth_dir = load_app_module()
+        try:
+            with run_test_server(app) as base_url:
+                base_payload = clone_json_fixture(ANTHROPIC_SIMPLE_TEXT_CHAT_FIXTURE)
+                base_payload["messages"][0]["content"][0]["text"] = "Return a JSON object with a title."
+                base_tokens = count_anthropic_tokens(base_url, base_payload)
+                schema_tokens = count_anthropic_tokens(
+                    base_url,
+                    clone_json_fixture(ANTHROPIC_OUTPUT_CONFIG_FORMAT_FIXTURE),
+                    extra_headers={"anthropic-beta": STRUCTURED_OUTPUTS_BETA_HEADER},
+                )
+            self.assertGreater(schema_tokens, base_tokens)
         finally:
             restore_auth_dir(tempdir, original_auth_dir)
 
@@ -831,6 +1509,82 @@ class Codex2GptCompatibilityTests(unittest.TestCase):
                     payload = json.load(resp)
             self.assertEqual(payload["model"], "claude-haiku-4-5")
             self.assertEqual(payload["content"][0]["text"], "hello")
+        finally:
+            restore_auth_dir(tempdir, original_auth_dir)
+
+    def test_messages_endpoint_accepts_anthropic_beta_header(self):
+        app, tempdir, original_auth_dir = load_app_module()
+        try:
+            canned = {
+                "id": "resp_beta",
+                "status": "completed",
+                "output": [{"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "hello"}]}],
+                "usage": {"input_tokens": 10, "output_tokens": 2},
+            }
+            with run_test_server(app, fetch_response=canned) as base_url:
+                req = urllib.request.Request(
+                    f"{base_url}/v1/messages",
+                    data=json.dumps(clone_json_fixture(ANTHROPIC_SIMPLE_TEXT_CHAT_FIXTURE)).encode("utf-8"),
+                    headers={
+                        "Content-Type": "application/json",
+                        "anthropic-version": "2023-06-01",
+                        "anthropic-beta": "structured-outputs-2025-01-01,tool-reference-2025-02-03",
+                    },
+                    method="POST",
+                )
+                with urllib.request.urlopen(req, timeout=30) as resp:
+                    payload = json.load(resp)
+            self.assertEqual(payload["type"], "message")
+            self.assertEqual(payload["content"][0]["text"], "hello")
+        finally:
+            restore_auth_dir(tempdir, original_auth_dir)
+
+    def test_messages_endpoint_rejects_structured_output_without_required_beta_header(self):
+        app, tempdir, original_auth_dir = load_app_module()
+        try:
+            with run_test_server(app) as base_url:
+                req = urllib.request.Request(
+                    f"{base_url}/v1/messages",
+                    data=json.dumps(clone_json_fixture(ANTHROPIC_OUTPUT_CONFIG_FORMAT_FIXTURE)).encode("utf-8"),
+                    headers={
+                        "Content-Type": "application/json",
+                        "anthropic-version": "2023-06-01",
+                    },
+                    method="POST",
+                )
+                with self.assertRaises(urllib.error.HTTPError) as ctx:
+                    urllib.request.urlopen(req, timeout=30)
+                payload = json.loads(ctx.exception.read().decode("utf-8"))
+            self.assertEqual(ctx.exception.code, 400)
+            self.assertEqual(payload["error"]["type"], "invalid_request_error")
+            self.assertIn("structured-outputs-*", payload["error"]["message"])
+        finally:
+            restore_auth_dir(tempdir, original_auth_dir)
+
+    def test_messages_endpoint_accepts_structured_output_with_required_beta_header(self):
+        app, tempdir, original_auth_dir = load_app_module()
+        try:
+            canned = {
+                "id": "resp_structured",
+                "status": "completed",
+                "output": [{"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "{\"title\":\"ok\"}"}]}],
+                "usage": {"input_tokens": 10, "output_tokens": 4},
+            }
+            with run_test_server(app, fetch_response=canned) as base_url:
+                req = urllib.request.Request(
+                    f"{base_url}/v1/messages",
+                    data=json.dumps(clone_json_fixture(ANTHROPIC_OUTPUT_CONFIG_FORMAT_FIXTURE)).encode("utf-8"),
+                    headers={
+                        "Content-Type": "application/json",
+                        "anthropic-version": "2023-06-01",
+                        "anthropic-beta": STRUCTURED_OUTPUTS_BETA_HEADER,
+                    },
+                    method="POST",
+                )
+                with urllib.request.urlopen(req, timeout=30) as resp:
+                    payload = json.load(resp)
+            self.assertEqual(payload["type"], "message")
+            self.assertEqual(payload["content"][0]["text"], "{\"title\":\"ok\"}")
         finally:
             restore_auth_dir(tempdir, original_auth_dir)
 

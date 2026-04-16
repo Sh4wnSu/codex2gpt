@@ -164,12 +164,67 @@ Anthropic 兼容层当前映射：
 - `claude-opus-4-6` -> 本地 `gpt-5.4-1m` -> 上游 `gpt-5.4`
 - `claude-sonnet-4-6` -> 本地 `gpt-5.4` -> 上游 `gpt-5.4`
 - `claude-haiku-4-5` -> 本地 `gpt-5.3-codex` -> 上游 `gpt-5.3-codex`
+- 也可以直接传 `gpt-5.4`、`gpt-5.4-1m`、`gpt-5.3-codex`，方便在 Claude Code 里显式切换 GPT 模型类型
 
 Anthropic 兼容层的 1M 特殊说明：
 
 - `claude-opus-4-6` 现在会走 `gpt-5.4-1m` 的模型预算，因此它默认就是 1M 上下文版本。
 - 如果你希望 Anthropic 接口走普通窗口，请使用 `claude-sonnet-4-6`。
 - 选择 `claude-opus-4-6` 同样会带来更高的 token 消耗、潜在更高成本，以及更慢的请求耗时。
+
+Anthropic 兼容层当前额外支持：
+
+- `thinking` 的 `budget_tokens` 与 `type: "adaptive"` 请求
+- `output_config.format` 和 `output_config.effort`
+- `speed: "fast"`。当请求带 `anthropic-beta: fast-mode-*` 时，代理会优先退回非 1M 路由，并在未显式指定 effort/thinking 时自动使用 `low` effort；响应 `usage` 也会回传 `speed: "fast"`
+- 用户消息里的 `image` 内容块
+- 用户消息里的 `document` 内容块，会映射到 Responses `input_file`
+- `POST /v1/messages/count_tokens`，会把 tools、image、structured output schema 一并计入估算
+- Bearer 鉴权或 Claude-Code 风格客户端的兼容型 SSE 输出
+- thinking 流式块会附带空 `signature_delta` 兼容事件
+
+和 `free-code` / Claude Code 一起使用时，当前还额外打通了这几类交互：
+
+- 可以直接把 `gpt-5.4`、`gpt-5.4-1m`、`gpt-5.3-codex` 作为 Anthropic `model` 传进来，方便在 `/model` 里显式切换 GPT 型号
+- `/model` picker 会按当前模型族显示对应选项。当前会话如果已经是 GPT 模型，就显示 GPT 选项；如果还是 Claude 模型，就继续显示 Claude 选项
+- `/effort` 现在可以直接弹出 effort 选择列表；`gpt-5.4` / `gpt-5.4-1m` 可用 `low`、`medium`、`high`、`extra-high`、`auto`
+- Anthropic 侧传入的 `extra-high` 会在代理层归一化成上游可接受的 `xhigh`
+- `/fast` 会走 `speed: "fast"` 的 Anthropic 兼容路径，要求 `anthropic-beta: fast-mode-*`；代理会优先避开 1M 路由，并把返回 `usage.speed` 设为 `fast`
+
+Anthropic 兼容层当前会接收但忽略：
+
+- `metadata`
+
+Anthropic 兼容层当前会校验并按需使用 `anthropic-beta`：
+
+- `output_config.format` 需要 `structured-outputs-*`
+- `output_config.effort` 需要 `effort-*`
+- `output_config.task_budget` 需要 `task-budgets-*`
+- `context_management` 需要 `context-management-*`
+- `speed: "fast"` 需要 `fast-mode-*`
+- 流式 `connector_text` 事件兼容需要 `summarize-connector-text-*`
+- `tool_reference` 和工具 schema 里的 `defer_loading` / `eager_input_streaming` 需要 `advanced-tool-use-*` 或 `tool-search-tool-*`
+
+在对应 beta 存在时：
+
+- `context_management` 和 `speed` 仍会被兼容层消费后忽略，不会原样透传到上游
+- 流式文本块会改为 `connector_text` / `connector_text_delta` 事件形状，并在结束前附带空 `signature_delta`
+
+Anthropic 兼容层当前对 `tool_reference` 的处理：
+
+- 会在 `tool_result` 中保留工具名信息，并翻译成兼容性文本提示转发给上游
+- 这不是 Anthropic 原生 server-side expansion 语义，但足够让 `free-code` 之类客户端继续沿消息历史维护“已发现工具”状态
+
+旧会话兼容层当前还会做的降级处理：
+
+- assistant 历史里的 `server_tool_use` 会保留工具名和输入摘要，并降级成文本继续转发
+- `connector_text` 会按普通文本块处理
+- `tool_result` 内容数组里的 `image` / `document` 会降级成占位文本，避免旧会话恢复时直接报错
+
+Anthropic 兼容层当前仍会明确拒绝：
+
+- 暂时无法安全映射的 `document.source.type = "content"` 之类形状
+- 仍无法安全映射的更深 Anthropic server-side 工具语义
 
 ```bash
 curl http://127.0.0.1:18100/v1/messages \

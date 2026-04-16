@@ -111,10 +111,18 @@ Common safe defaults:
 
 Anthropic compatibility currently accepts these aliases:
 
-- `claude-opus-4-6` -> `gpt-5.4`
-- `claude-sonnet-4-6` -> `gpt-5.3-codex`
+- `claude-opus-4-6` -> `gpt-5.4-1m` -> upstream `gpt-5.4`
+- `claude-sonnet-4-6` -> `gpt-5.4` -> upstream `gpt-5.4`
+- `claude-haiku-4-5` -> `gpt-5.3-codex` -> upstream `gpt-5.3-codex`
+- Direct GPT model IDs such as `gpt-5.4`, `gpt-5.4-1m`, and `gpt-5.3-codex` are also accepted for Claude Code `/model gpt-*` flows
 
 Unsupported Anthropic aliases are rejected.
+
+Fast mode behavior:
+
+- `speed: "fast"` still requires `anthropic-beta: fast-mode-*`
+- When fast mode is active, the proxy prefers the non-1M sibling route and falls back to `low` reasoning effort only when the request did not already specify effort or thinking
+- Anthropic-compatible responses echo `usage.speed = "fast"` so Claude Code can reflect the active fast-mode state correctly
 
 ## Minimal Examples
 
@@ -153,6 +161,52 @@ curl http://127.0.0.1:18100/v1/chat/completions \
 Anthropic-compatible requests must include:
 
 - `anthropic-version: 2023-06-01`
+
+Current first-pass Anthropic compatibility also supports:
+
+- `thinking` with `budget_tokens` and `type: "adaptive"`
+- `output_config.format`
+- `output_config.effort`
+- user `image` blocks
+- user `document` blocks that can map to Responses `input_file`
+- `POST /v1/messages/count_tokens` with tool/schema/image-aware estimation
+- empty `signature_delta` compatibility frames for streamed thinking blocks
+
+Current accept-and-ignore behavior:
+
+- `metadata`
+
+Current beta-gated behavior:
+
+- `output_config.format` requires `anthropic-beta: structured-outputs-*`
+- `output_config.effort` requires `anthropic-beta: effort-*`
+- `output_config.task_budget` requires `anthropic-beta: task-budgets-*`
+- `context_management` requires `anthropic-beta: context-management-*`
+- `speed: "fast"` requires `anthropic-beta: fast-mode-*`
+- streaming `connector_text` compatibility requires `anthropic-beta: summarize-connector-text-*`
+- `tool_reference` plus tool-schema `defer_loading` / `eager_input_streaming` require `anthropic-beta: advanced-tool-use-*` or `tool-search-tool-*`
+
+When the matching beta is present:
+
+- `context_management` and `speed` are still consumed and ignored by the compatibility layer instead of being forwarded upstream
+- streamed text blocks switch to `connector_text` / `connector_text_delta` event shapes and include an empty `signature_delta` before close
+
+Current compatibility handling for `tool_reference`:
+
+- accepted inside `tool_result` content
+- flattened into text hints that preserve discovered tool names
+- intended as a compatibility approximation, not full Anthropic expansion semantics
+
+Current history-compatibility downgrades:
+
+- assistant-history `server_tool_use` blocks are flattened into text
+- `connector_text` blocks are treated as ordinary text
+- `image` / `document` items nested inside `tool_result` content are downgraded into placeholders
+
+Current explicit rejections:
+
+- `document.source.type = "content"` and other document shapes that do not map cleanly to `input_file`
+- deeper Anthropic server-side tool semantics that still do not map safely
 
 ```bash
 curl http://127.0.0.1:18100/v1/messages \

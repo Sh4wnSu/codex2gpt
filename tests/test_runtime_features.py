@@ -1,4 +1,5 @@
 import errno
+import http.client
 import json
 import tempfile
 import unittest
@@ -7,6 +8,8 @@ import urllib.request
 from pathlib import Path
 
 from tests.test_app import load_app_module, make_test_jwt, restore_auth_dir, run_test_server
+
+CONNECTOR_TEXT_BETA_HEADER = "summarize-connector-text-2026-03-13"
 
 
 def sse_body(events):
@@ -178,8 +181,165 @@ class RuntimeFeatureTests(unittest.TestCase):
                 with urllib.request.urlopen(req, timeout=30) as resp:
                     body = resp.read().decode("utf-8")
             self.assertIn("thinking_delta", body)
+            self.assertIn("signature_delta", body)
             self.assertIn("input_json_delta", body)
             self.assertIn("message_stop", body)
+        finally:
+            restore_auth_dir(tempdir, original_auth_dir)
+
+    def test_messages_streams_reasoning_for_adaptive_thinking_requests(self):
+        app, tempdir, original_auth_dir = load_app_module()
+        try:
+            upstream_body = sse_body(
+                [
+                    ("response.created", {"type": "response.created", "response": {"id": "resp_adaptive"}}),
+                    ("response.reasoning_summary_text.delta", {"type": "response.reasoning_summary_text.delta", "delta": "Adaptive"}),
+                    (
+                        "response.completed",
+                        {
+                            "type": "response.completed",
+                            "response": {
+                                "id": "resp_adaptive",
+                                "status": "completed",
+                                "output": [
+                                    {
+                                        "type": "message",
+                                        "role": "assistant",
+                                        "content": [{"type": "output_text", "text": "done"}],
+                                    }
+                                ],
+                                "usage": {"input_tokens": 10, "output_tokens": 3},
+                            },
+                        },
+                    ),
+                ]
+            )
+            with run_test_server(app, upstream_body=upstream_body) as base_url:
+                req = urllib.request.Request(
+                    f"{base_url}/v1/messages",
+                    data=json.dumps(
+                        {
+                            "model": "claude-opus-4-6",
+                            "max_tokens": 64,
+                            "stream": True,
+                            "thinking": {"type": "adaptive"},
+                            "messages": [{"role": "user", "content": "hello"}],
+                        }
+                    ).encode("utf-8"),
+                    headers={"Content-Type": "application/json", "anthropic-version": "2023-06-01"},
+                    method="POST",
+                )
+                with urllib.request.urlopen(req, timeout=30) as resp:
+                    body = resp.read().decode("utf-8")
+            self.assertIn("thinking_delta", body)
+            self.assertIn("signature_delta", body)
+            self.assertIn("message_stop", body)
+        finally:
+            restore_auth_dir(tempdir, original_auth_dir)
+
+    def test_messages_streams_connector_text_deltas_when_beta_requested(self):
+        app, tempdir, original_auth_dir = load_app_module()
+        try:
+            upstream_body = sse_body(
+                [
+                    ("response.created", {"type": "response.created", "response": {"id": "resp_connector"}}),
+                    ("response.output_text.delta", {"type": "response.output_text.delta", "delta": "Search"}),
+                    ("response.output_text.delta", {"type": "response.output_text.delta", "delta": "ing"}),
+                    (
+                        "response.completed",
+                        {
+                            "type": "response.completed",
+                            "response": {
+                                "id": "resp_connector",
+                                "status": "completed",
+                                "output": [
+                                    {
+                                        "type": "message",
+                                        "role": "assistant",
+                                        "content": [{"type": "output_text", "text": "Searching"}],
+                                    }
+                                ],
+                                "usage": {"input_tokens": 10, "output_tokens": 3},
+                            },
+                        },
+                    ),
+                ]
+            )
+            with run_test_server(app, upstream_body=upstream_body) as base_url:
+                req = urllib.request.Request(
+                    f"{base_url}/v1/messages",
+                    data=json.dumps(
+                        {
+                            "model": "claude-opus-4-6",
+                            "max_tokens": 64,
+                            "stream": True,
+                            "messages": [{"role": "user", "content": "hello"}],
+                        }
+                    ).encode("utf-8"),
+                    headers={
+                        "Content-Type": "application/json",
+                        "anthropic-version": "2023-06-01",
+                        "anthropic-beta": CONNECTOR_TEXT_BETA_HEADER,
+                    },
+                    method="POST",
+                )
+                with urllib.request.urlopen(req, timeout=30) as resp:
+                    body = resp.read().decode("utf-8")
+            self.assertIn('"type": "connector_text"', body)
+            self.assertIn("connector_text_delta", body)
+            self.assertIn("signature_delta", body)
+        finally:
+            restore_auth_dir(tempdir, original_auth_dir)
+
+    def test_messages_stream_reports_fast_speed_when_requested(self):
+        app, tempdir, original_auth_dir = load_app_module()
+        try:
+            upstream_body = sse_body(
+                [
+                    ("response.created", {"type": "response.created", "response": {"id": "resp_fast"}}),
+                    ("response.output_text.delta", {"type": "response.output_text.delta", "delta": "OK"}),
+                    (
+                        "response.completed",
+                        {
+                            "type": "response.completed",
+                            "response": {
+                                "id": "resp_fast",
+                                "status": "completed",
+                                "output": [
+                                    {
+                                        "type": "message",
+                                        "role": "assistant",
+                                        "content": [{"type": "output_text", "text": "OK"}],
+                                    }
+                                ],
+                                "usage": {"input_tokens": 10, "output_tokens": 3},
+                            },
+                        },
+                    ),
+                ]
+            )
+            with run_test_server(app, upstream_body=upstream_body) as base_url:
+                req = urllib.request.Request(
+                    f"{base_url}/v1/messages",
+                    data=json.dumps(
+                        {
+                            "model": "claude-opus-4-6",
+                            "max_tokens": 64,
+                            "stream": True,
+                            "speed": "fast",
+                            "messages": [{"role": "user", "content": "hello"}],
+                        }
+                    ).encode("utf-8"),
+                    headers={
+                        "Content-Type": "application/json",
+                        "anthropic-version": "2023-06-01",
+                        "anthropic-beta": "fast-mode-2026-02-01",
+                    },
+                    method="POST",
+                )
+                with urllib.request.urlopen(req, timeout=30) as resp:
+                    body = resp.read().decode("utf-8")
+            self.assertIn('"speed": "fast"', body)
         finally:
             restore_auth_dir(tempdir, original_auth_dir)
 
@@ -237,6 +397,108 @@ class RuntimeFeatureTests(unittest.TestCase):
             self.assertIn("CLAUDE-COMPAT", body)
             self.assertIn("message_stop", body)
             self.assertTrue(content_length)
+        finally:
+            restore_auth_dir(tempdir, original_auth_dir)
+
+    def test_messages_buffered_stream_uses_connector_text_events_when_beta_requested(self):
+        app, tempdir, original_auth_dir = load_app_module()
+        try:
+            upstream_body = sse_body(
+                [
+                    (
+                        "response.completed",
+                        {
+                            "type": "response.completed",
+                            "response": {
+                                "id": "resp_buffered_connector",
+                                "status": "completed",
+                                "output": [
+                                    {
+                                        "type": "message",
+                                        "role": "assistant",
+                                        "content": [{"type": "output_text", "text": "CLAUDE-COMPAT"}],
+                                    }
+                                ],
+                                "usage": {
+                                    "input_tokens": 12,
+                                    "output_tokens": 3,
+                                },
+                            },
+                        },
+                    )
+                ]
+            )
+            with run_test_server(app, upstream_body=upstream_body, account_name="acct-buffered.json") as base_url:
+                req = urllib.request.Request(
+                    f"{base_url}/v1/messages",
+                    data=json.dumps(
+                        {
+                            "model": "claude-opus-4-6",
+                            "max_tokens": 64,
+                            "stream": True,
+                            "messages": [{"role": "user", "content": "hello"}],
+                        }
+                    ).encode("utf-8"),
+                    headers={
+                        "Content-Type": "application/json",
+                        "anthropic-version": "2023-06-01",
+                        "Authorization": "Bearer test-oauth-token",
+                        "anthropic-beta": CONNECTOR_TEXT_BETA_HEADER,
+                    },
+                    method="POST",
+                )
+                with urllib.request.urlopen(req, timeout=30) as resp:
+                    body = resp.read().decode("utf-8")
+            self.assertIn('"type": "connector_text"', body)
+            self.assertIn("connector_text_delta", body)
+            self.assertIn("signature_delta", body)
+        finally:
+            restore_auth_dir(tempdir, original_auth_dir)
+
+    def test_messages_stream_ignores_client_disconnect_errors(self):
+        app, tempdir, original_auth_dir = load_app_module()
+        try:
+            original_stream = app.Handler._stream_anthropic_message_from_upstream
+            original_write_error = app.Handler._write_anthropic_error
+            original_record_failed = app.Handler._record_failed_transcript
+            write_errors = []
+            failed_transcripts = []
+
+            def fake_stream(self, payload, session_key, *, model, include_thinking=False, connector_text_mode=False, requested_speed=None):
+                raise BrokenPipeError(errno.EPIPE, "Broken pipe")
+
+            def fake_write_error(self, status, error_type, message):
+                write_errors.append((status, error_type, message))
+
+            def fake_record_failed(self, *args, **kwargs):
+                failed_transcripts.append((args, kwargs))
+
+            app.Handler._stream_anthropic_message_from_upstream = fake_stream
+            app.Handler._write_anthropic_error = fake_write_error
+            app.Handler._record_failed_transcript = fake_record_failed
+            try:
+                with run_test_server(app) as base_url:
+                    req = urllib.request.Request(
+                        f"{base_url}/v1/messages",
+                        data=json.dumps(
+                            {
+                                "model": "claude-opus-4-6",
+                                "max_tokens": 64,
+                                "stream": True,
+                                "messages": [{"role": "user", "content": "hello"}],
+                            }
+                        ).encode("utf-8"),
+                        headers={"Content-Type": "application/json", "anthropic-version": "2023-06-01"},
+                        method="POST",
+                    )
+                    with self.assertRaises((http.client.RemoteDisconnected, urllib.error.URLError, OSError)):
+                        urllib.request.urlopen(req, timeout=10).read()
+                self.assertEqual(write_errors, [])
+                self.assertEqual(failed_transcripts, [])
+            finally:
+                app.Handler._stream_anthropic_message_from_upstream = original_stream
+                app.Handler._write_anthropic_error = original_write_error
+                app.Handler._record_failed_transcript = original_record_failed
         finally:
             restore_auth_dir(tempdir, original_auth_dir)
 
